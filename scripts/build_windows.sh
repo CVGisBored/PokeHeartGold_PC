@@ -17,8 +17,8 @@ cmake -S "$ROOT" -B "$BUILD" \
   -DBUILD_TESTING=OFF
 cmake --build "$BUILD" --config Release -j"$(nproc)"
 mkdir -p "$OUT"
-cp "$BUILD/heartgold_native.exe" "$OUT/HeartGoldNative-v0.37-Windows-x86_64.exe"
-cp "$BUILD/heartgold_native.exe" "$ROOT/HeartGoldNative-v0.37-Windows-x86_64.exe"
+cp "$BUILD/heartgold_native.exe" "$OUT/HeartGoldNative.exe"
+cp "$BUILD/heartgold_native.exe" "$ROOT/HeartGoldNative.exe"
 file "$OUT/HeartGoldNative-v0.37-Windows-x86_64.exe" || true
-printf '\nBuilt: %s\n' "$ROOT/HeartGoldNative-v0.37-Windows-x86_64.exe"
-printf 'Mirror: %s\n' "$OUT/HeartGoldNative-v0.37-Windows-x86_64.exe"
+printf '\nBuilt: %s\n' "$ROOT/HeartGoldNative.exe"
+printf 'Mirror: %s\n' "$OUT/HeartGoldNative.exe"
