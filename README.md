@@ -47,7 +47,3 @@ Once assets have been prepared, future runs can use:
 ## Important distribution note
 
 Do **not** repackage the locally generated `assets/nitrofs`, `assets/bin`, or `assets/overlays` directories into this asset-free archive unless you have permission to distribute that content. This package was specifically prepared so those original game payloads are absent.
-
-## v0.42 code state
-
-This package retains the v0.42 engine changes, including the opening-animation timing work, directional ledge jumping, F3 walk-through-walls debug control, dialogue spacing adjustments, door hold timing, trainer throw anchoring, and the earlier v0.41 performance/service-counter/battle-alignment work.
