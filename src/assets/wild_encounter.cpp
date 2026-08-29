@@ -1,0 +1,5 @@
+#include "assets/wild_encounter.hpp"
+#include "assets/nsbmd.hpp"
+namespace{std::uint16_t u16(const std::vector<unsigned char>&b,std::size_t p){return p+2<=b.size()?std::uint16_t(b[p])|(std::uint16_t(b[p+1])<<8):0;}}
+HgWildTable load_hg_wild_table(const std::filesystem::path& assets,std::size_t bank){HgWildTable o;auto b=read_narc_member(assets/"a/0/3/7",bank);if(b.size()!=0xc4){o.error="encounter member is not 0xC4 bytes";return o;}o.walkingRate=b[0];for(int tod=0;tod<3;tod++){auto* dst=tod==0?&o.morning:tod==1?&o.day:&o.night;dst->reserve(12);for(int i=0;i<12;i++){HgWildSlot s;s.minLevel=s.maxLevel=b[8+i];s.species=u16(b,0x14+tod*24+i*2);dst->push_back(s);}}o.valid=true;return o;}
+HgWildSlot choose_hg_land_encounter(const HgWildTable& t,std::uint32_t roll,int hour){auto const& v=(hour<10?t.morning:(hour>=20?t.night:t.day));if(v.empty())return{};static const int weights[12]={20,20,10,10,10,10,5,5,4,4,1,1};int r=int(roll%100),sum=0;for(int i=0;i<12;i++){sum+=weights[i];if(r<sum)return v[i];}return v.back();}

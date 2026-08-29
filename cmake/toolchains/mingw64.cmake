@@ -1,0 +1,14 @@
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+
+if(DEFINED ENV{HG_MINGW_PREFIX})
+  set(_HG_PREFIX "$ENV{HG_MINGW_PREFIX}")
+else()
+  set(_HG_PREFIX "x86_64-w64-mingw32")
+endif()
+
+find_program(CMAKE_C_COMPILER NAMES ${_HG_PREFIX}-gcc ${_HG_PREFIX}-clang REQUIRED)
+find_program(CMAKE_CXX_COMPILER NAMES ${_HG_PREFIX}-g++ ${_HG_PREFIX}-clang++ REQUIRED)
+find_program(CMAKE_RC_COMPILER NAMES ${_HG_PREFIX}-windres ${_HG_PREFIX}-llvm-rc windres llvm-rc)
+
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
