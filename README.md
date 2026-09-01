@@ -1,6 +1,4 @@
-# Pokémon HeartGold Native Port v0.42 — Asset-Free Distribution
-
-This is the **distribution-only** v0.42 package. It is a separate copy of the development tree and intentionally excludes the original game's ROM-derived payloads.
+# HG/SS Native PC Port v0.46.5 — source-only package
 
 ## What is included
 
