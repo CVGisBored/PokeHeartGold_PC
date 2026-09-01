@@ -219,3 +219,9 @@ bool hg_permission_is_ledge_jump(const HgPermissionCell& cell,int dx,int dy){
     if(dx==0&&dy==1)return cell.type==59;
     return false;
 }
+
+int hg_permission_stair_warp_direction(const HgPermissionCell& cell){
+    if(cell.type==94)return 1;
+    if(cell.type==95)return -1;
+    return 0;
+}

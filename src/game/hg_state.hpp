@@ -46,6 +46,12 @@ public:
     std::vector<HgMon> party;
     std::vector<HgMon> pcStorage;
     std::unordered_set<std::uint16_t> dexSeen,dexOwned;
+    // Mystery Gift identity and redeemed event IDs live inside the save file.
+    // This mirrors retail's save-bound Wonder Card / delivery state: deleting a
+    // machine-local client-id file or resetting the server cannot make a gift
+    // redeemable again on the same save.
+    std::string mysteryGiftSaveId;
+    std::unordered_set<std::string> mysteryGiftClaims;
     std::uint32_t money=3000;
     std::uint32_t momSavings=0;
     std::uint16_t savedPhotos=0;

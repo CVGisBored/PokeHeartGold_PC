@@ -102,3 +102,8 @@ bool hg_permission_is_counter(const HgPermissionCell& cell);
 // behaviors JUMP_EAST/WEST/NORTH/SOUTH (56..59). A jump is only legal in
 // the authored direction; callers still validate the landing tile.
 bool hg_permission_is_ledge_jump(const HgPermissionCell& cell,int dx,int dy);
+
+// Retail stair-warp tile behavior. 0x5E walks east across the staircase,
+// 0x5F walks west. The field runtime uses this to animate the player across
+// authored stair warps instead of teleporting as soon as the warp cell is hit.
+int hg_permission_stair_warp_direction(const HgPermissionCell& cell);

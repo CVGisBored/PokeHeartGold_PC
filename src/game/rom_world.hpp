@@ -23,6 +23,7 @@ public:
     bool commitPosition(int x,int y);
     bool processWarp();
     bool useWarpAt(int x,int y);
+    bool useWarpAtExact(int x,int y);
     void refreshVisible();
 
     bool ready() const { return ready_; }
@@ -68,5 +69,5 @@ private:
     std::pair<int,int> cellForTile(int x,int y) const;
     std::pair<int,int> localForTile(int x,int y) const;
     bool isWarpTile(int x,int y) const;
-    bool moveToDestination(const HgWarpEvent& sourceWarp);
+    bool moveToDestination(const HgWarpEvent& sourceWarp,bool spawnAway=true);
 };

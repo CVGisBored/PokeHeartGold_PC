@@ -100,26 +100,29 @@ bool HgRomWorld::commitPosition(int x,int y){
     return true;
 }
 
-bool HgRomWorld::moveToDestination(const HgWarpEvent& w){
+bool HgRomWorld::moveToDestination(const HgWarpEvent& w,bool spawnAway){
     const auto* target=hg_map_header(w.targetMap);if(!target){lastTransition_="TARGET MAP "+std::to_string(w.targetMap)+" NOT PORTED YET";return false;}
     auto targetEvents=load_hg_event_bank(assets_,target->eventsBank);if(!targetEvents.valid||w.targetWarp>=targetEvents.warps.size()){lastTransition_="TARGET WARP DATA INVALID";return false;}
     const auto destination=targetEvents.warps[w.targetWarp];
     if(!loadHeaderData(w.targetMap,true))return false;
     x_=destination.x;y_=destination.y;
-    // Spawn one tile away from the destination warp so it cannot instantly bounce.
-    int dx=0,dy=0;
-    if(target->mapType==4){
-        if(y_>=8)dy=-1;else dy=1;
-    }else{
-        int ly=mod32(y_),lx=mod32(x_);
-        if(ly<16)dy=1;else dy=-1;
-        if(!canMoveTo(x_+dx,y_+dy)){dy=0;if(lx<16)dx=1;else dx=-1;}
+    if(spawnAway){
+        // Ordinary doors/warps spawn one tile away so they cannot instantly bounce.
+        int dx=0,dy=0;
+        if(target->mapType==4){
+            if(y_>=8)dy=-1;else dy=1;
+        }else{
+            int ly=mod32(y_),lx=mod32(x_);
+            if(ly<16)dy=1;else dy=-1;
+            if(!canMoveTo(x_+dx,y_+dy)){dy=0;if(lx<16)dx=1;else dx=-1;}
+        }
+        if(canMoveTo(x_+dx,y_+dy)){x_+=dx;y_+=dy;}
     }
-    if(canMoveTo(x_+dx,y_+dy)){x_+=dx;y_+=dy;}
     refreshVisible();lastTransition_=locationName();return true;
 }
-bool HgRomWorld::processWarp(){for(auto const& w:events_.warps)if(w.x==x_&&w.y==y_)return moveToDestination(w);return false;}
-bool HgRomWorld::useWarpAt(int x,int y){for(auto const& w:events_.warps)if(w.x==x&&w.y==y)return moveToDestination(w);return false;}
+bool HgRomWorld::processWarp(){for(auto const& w:events_.warps)if(w.x==x_&&w.y==y_)return moveToDestination(w,true);return false;}
+bool HgRomWorld::useWarpAt(int x,int y){for(auto const& w:events_.warps)if(w.x==x&&w.y==y)return moveToDestination(w,true);return false;}
+bool HgRomWorld::useWarpAtExact(int x,int y){for(auto const& w:events_.warps)if(w.x==x&&w.y==y)return moveToDestination(w,false);return false;}
 
 const HgPermissionCell* HgRomWorld::permissionAt(int x,int y) const{auto* c=chunkForTile(x,y);if(!c||!c->land.valid)return nullptr;auto [lx,ly]=localForTile(x,y);return c->land.permission_at(lx,ly);}
 bool HgRomWorld::isLandEncounterTile(int x,int y) const{auto* p=permissionAt(x,y);return p&&hg_permission_allows_land_encounter(*p);}

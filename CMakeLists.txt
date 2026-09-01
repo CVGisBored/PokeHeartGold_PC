@@ -26,12 +26,13 @@ add_executable(heartgold_native
   src/game/game.cpp
   src/game/hg_state.cpp
   src/game/retail_mart.cpp
+  src/game/mystery_gift.cpp
   src/game/hg_script.cpp
   src/game/script_header.cpp
   src/game/rom_world.cpp)
 target_include_directories(heartgold_native PRIVATE src)
 if(WIN32)
-  target_link_libraries(heartgold_native PRIVATE user32 gdi32 winmm)
+  target_link_libraries(heartgold_native PRIVATE user32 gdi32 winmm ws2_32)
   target_compile_definitions(heartgold_native PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_link_options(heartgold_native PRIVATE -static)
 else()
@@ -296,4 +297,68 @@ else()
 endif()
 target_compile_options(battle_bgm_sdat_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
 add_test(NAME retail_battle_bgm_sdat COMMAND battle_bgm_sdat_test ${CMAKE_SOURCE_DIR}/assets/nitrofs)
+endif()
+
+# Standalone integration helper for the custom Mystery Gift TCP protocol.
+# It expects an already-running test server (default 127.0.0.1:1249).
+add_executable(mystery_gift_protocol_test
+  tests/mystery_gift_protocol_test.cpp
+  src/game/mystery_gift.cpp
+  src/game/hg_state.cpp
+  src/assets/pokemon_data.cpp
+  src/assets/hg_text.cpp
+  src/assets/narc.cpp
+  src/assets/nsbmd.cpp)
+target_include_directories(mystery_gift_protocol_test PRIVATE src)
+target_compile_options(mystery_gift_protocol_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+if(WIN32)
+  target_link_libraries(mystery_gift_protocol_test PRIVATE ws2_32)
+endif()
+add_executable(mystery_gift_pokemon_test
+  tests/mystery_gift_pokemon_test.cpp
+  src/game/mystery_gift.cpp
+  src/game/hg_state.cpp
+  src/assets/pokemon_data.cpp
+  src/assets/hg_text.cpp
+  src/assets/narc.cpp
+  src/assets/nsbmd.cpp)
+target_include_directories(mystery_gift_pokemon_test PRIVATE src)
+target_compile_options(mystery_gift_pokemon_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+if(WIN32)
+  target_link_libraries(mystery_gift_pokemon_test PRIVATE ws2_32)
+endif()
+
+
+# v0.44: verify the exact ROM resources used by the native Mystery Gift UI and
+# the retail overlay-75 BGM sequence before release packaging.
+if(BUILD_TESTING)
+add_executable(mystery_gift_retail_assets_test
+  tests/mystery_gift_retail_assets_test.cpp
+  src/assets/nitro2d.cpp
+  src/assets/narc.cpp
+  src/assets/nsbmd.cpp
+  src/assets/sdat.cpp)
+target_include_directories(mystery_gift_retail_assets_test PRIVATE src)
+target_compile_options(mystery_gift_retail_assets_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+if(WIN32)
+  target_link_libraries(mystery_gift_retail_assets_test PRIVATE winmm)
+else()
+  target_link_libraries(mystery_gift_retail_assets_test PRIVATE dl)
+endif()
+add_test(NAME retail_mystery_gift_assets_and_bgm
+  COMMAND mystery_gift_retail_assets_test ${CMAKE_SOURCE_DIR}/assets/nitrofs)
+endif()
+
+# v0.45: preserve retail build-model material animations (including the wind
+# turbine SRT) and the HG/SS room-material convention used by furniture/plants.
+if(BUILD_TESTING)
+add_executable(field_building_animation_material_test
+  tests/field_building_animation_material_test.cpp
+  src/assets/nsbmd.cpp
+  src/assets/narc.cpp
+  src/assets/land_data.cpp)
+target_include_directories(field_building_animation_material_test PRIVATE src)
+target_compile_options(field_building_animation_material_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+add_test(NAME retail_field_building_animation_and_room_materials
+  COMMAND field_building_animation_material_test ${CMAKE_SOURCE_DIR}/assets/nitrofs)
 endif()

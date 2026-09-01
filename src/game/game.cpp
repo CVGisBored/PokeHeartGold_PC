@@ -13,6 +13,7 @@
 #include "assets/sdat.hpp"
 #include "game/hg_state.hpp"
 #include "game/retail_mart.hpp"
+#include "game/mystery_gift.hpp"
 #include "game/script_header.hpp"
 #include "game/hg_script.hpp"
 #include "game/rom_world.hpp"
@@ -55,10 +56,12 @@ constexpr std::uint16_t SEQ_GS_TITLE             = 1004;
 constexpr std::uint16_t SEQ_GS_OPENING_TITLE_G   = 1006;
 constexpr std::uint16_t SEQ_GS_POKEMON_THEME     = 1008;
 constexpr std::uint16_t SEQ_GS_STARTING           = 1009;
+// Retail Mystery Gift application (overlay 75) BGM sequence.
+constexpr std::uint16_t SEQ_GS_MYSTERY_GIFT       = 1149;
 
 enum class Tile : unsigned char { Grass, Path, Water, Tree, Wall, Floor, Door, Flower, Counter, Ledge, Sand };
 enum class Dir : int { Down=0, Left=1, Right=2, Up=3 };
-enum class Mode { Intro, Title, MainMenu, NewGameIntro, SavePrompt, Field, Dialogue, ScriptChoice, BankAmount, Menu, Party, PCStorage, Bag, Pokedex, Pokegear, TownMap, Mart, Naming, Summary, StarterSelect, Battle, SpriteViewer, AssetViewer, TerrainSandbox };
+enum class Mode { Intro, Title, MainMenu, MysteryGift, NewGameIntro, SavePrompt, Field, Dialogue, ScriptChoice, BankAmount, Menu, Party, PCStorage, Bag, Pokedex, Pokegear, TownMap, Mart, Naming, Summary, StarterSelect, Battle, SpriteViewer, AssetViewer, TerrainSandbox };
 enum class AssetSource { Field, Room, Land };
 
 // Object-event SPRITE_* -> a/0/8/1 MMODEL_* resolution lives in
@@ -661,7 +664,9 @@ struct PreparedFieldTriangle {
 static void preparePlacedNsbmdModel(std::vector<PreparedFieldTriangle>& prepared,const NsbmdModel& model,const std::vector<NsbmdTexture>* textures,
                                     float translateX,float translateY,float translateZ,const HgFieldCamera& camera,float sceneLight,
                                     double animClock,std::uint16_t dynamicTextureType,
-                                    std::uint16_t xr=0,std::uint16_t yr=0,std::uint16_t zr=0){
+                                    std::uint16_t xr=0,std::uint16_t yr=0,std::uint16_t zr=0,
+                                    const NsbtaAnimation* materialAnimation=nullptr,
+                                    const NsbcaAnimation* jointAnimation=nullptr){
     if(model.triangles.empty())return;
     const float ms=std::isfinite(model.normalizedScale)&&model.normalizedScale>0.0001f?model.normalizedScale:1.0f;
     const PlacedRotation rotation=makePlacedRotation(xr,yr,zr);
@@ -679,10 +684,21 @@ static void preparePlacedNsbmdModel(std::vector<PreparedFieldTriangle>& prepared
         if(allLeft||allRight||allAbove||allBelow)return;
     }
     prepared.reserve(prepared.size()+model.triangles.size());
+    std::vector<Vec2f> materialUvAnimation(model.materialNames.size());
+    if(materialAnimation&&materialAnimation->valid){
+        for(size_t mi=0;mi<model.materialNames.size();mi++)
+            materialUvAnimation[mi]=sample_nsbta_uv(*materialAnimation,model.materialNames[mi],animClock,30.0);
+    }
+    std::vector<NsbmdMatrix> jointDeltas;
+    if(jointAnimation&&jointAnimation->valid&&!model.jointBindWorldMatrices.empty()){
+        jointDeltas.reserve(model.jointBindWorldMatrices.size());
+        for(size_t ji=0;ji<model.jointBindWorldMatrices.size();ji++)jointDeltas.push_back(sample_nsbca_joint_delta(model,*jointAnimation,int(ji),animClock,30.0));
+    }
+    auto posed=[&](const NsbmdVertex& v,int joint){Vec3f p=v.position;if(joint>=0&&size_t(joint)<jointDeltas.size())p=transform_nsbmd_point(jointDeltas[size_t(joint)],p);return Vec3f{p.x*ms,p.y*ms,p.z*ms};};
     for(auto const& t:model.triangles){
-        Vec3f pa=rotatePlaced({t.a.position.x*ms,t.a.position.y*ms,t.a.position.z*ms},rotation);
-        Vec3f pb=rotatePlaced({t.b.position.x*ms,t.b.position.y*ms,t.b.position.z*ms},rotation);
-        Vec3f pc=rotatePlaced({t.c.position.x*ms,t.c.position.y*ms,t.c.position.z*ms},rotation);
+        Vec3f pa=rotatePlaced(posed(t.a,t.jointIndex),rotation);
+        Vec3f pb=rotatePlaced(posed(t.b,t.jointIndex),rotation);
+        Vec3f pc=rotatePlaced(posed(t.c,t.jointIndex),rotation);
         auto a=projectWorldPoint(pa,translateX,translateY,translateZ,camera);
         auto b=projectWorldPoint(pb,translateX,translateY,translateZ,camera);
         auto c=projectWorldPoint(pc,translateX,translateY,translateZ,camera);
@@ -713,6 +729,10 @@ static void preparePlacedNsbmdModel(std::vector<PreparedFieldTriangle>& prepared
                 const float phase=float(std::fmod(animClock,16.0));
                 if(animateAxis==1)q.animU=std::floor(phase*4.0f)*0.25f;
                 else q.animV=std::floor(phase*6.0f)*0.25f;
+            }
+            if(t.materialIndex>=0&&size_t(t.materialIndex)<materialUvAnimation.size()){
+                q.animU+=materialUvAnimation[size_t(t.materialIndex)].x;
+                q.animV+=materialUvAnimation[size_t(t.materialIndex)].y;
             }
         }
         prepared.push_back(q);
@@ -870,6 +890,10 @@ struct NativeGame::Impl {
     bool romWorldReady=false;
     std::map<int,NsbmdMember> romFieldBuildings;
     std::map<int,NsbmdMember> romRoomBuildings;
+    std::map<int,NsbtaAnimation> romFieldBuildingSrt;
+    std::map<int,NsbtaAnimation> romRoomBuildingSrt;
+    std::map<int,NsbcaAnimation> romFieldBuildingJnt;
+    std::map<int,NsbcaAnimation> romRoomBuildingJnt;
     mutable std::map<int,NsbmdMember> romNpcSprites;
     AssetStats stats{};
     bool assetsReady=false;
@@ -880,7 +904,7 @@ struct NativeGame::Impl {
     int fromX=16,fromY=11,toX=16,toY=11;
     float moveProgress=1.0f;
     struct FieldTransition {
-        enum class Phase { None, DoorOpening, DoorOpenHold, AutoStep, DoorClosing, FadeOut, FadeIn, DestinationAutoStep, DestinationDoorHold, DestinationDoorClosing };
+        enum class Phase { None, DoorOpening, DoorOpenHold, AutoStep, DoorClosing, FadeOut, FadeIn, DestinationAutoStep, DestinationDoorHold, DestinationDoorClosing, StairSourceWalk, StairFadeOut, StairFadeIn, StairDestinationWalk };
         Phase phase=Phase::None;
         double clock=0.0;
         HgWarpEvent warp{};
@@ -896,6 +920,9 @@ struct NativeGame::Impl {
         int destinationWalkSteps=0;
         float doorAmount=0.0f;
         float fade=0.0f;
+        bool stairWarp=false;
+        int stairDirection=0; // -1 west, +1 east
+        float stairAmount=0.0f;
         bool active() const { return phase!=Phase::None; }
         void clear(){*this=FieldTransition{};}
     } fieldTransition;
@@ -972,6 +999,22 @@ struct NativeGame::Impl {
     std::vector<NitroRgbaImage> newGameOakCells, newGameBoyCells, newGameGirlCells, newGameMarillCells;
     bool newGameRetailAssets=false;
     int mainMenuIndex=0;
+    HgMysteryGiftConfig mysteryGiftConfig{};
+    std::string mysteryGiftClientId;
+    std::string mysteryGiftStatus="PRESS ENTER TO CONNECT";
+    std::string mysteryGiftDetail;
+    bool mysteryGiftLoadedSave=false;
+    // Retail Mystery Gift application resources from NARC a/0/8/8.
+    // These are decoded directly from the user's HG ROM assets, not recreated art.
+    bool mysteryGiftAssetsTried=false;
+    bool mysteryGiftRetailAssets=false;
+    bool mysteryGiftAnimating=false;
+    double mysteryGiftClock=0.0;
+    double mysteryGiftAnimClock=0.0;
+    NitroRgbaImage mysteryGiftTopArt{},mysteryGiftMenuArt{};
+    NitroRgbaImage mysteryGiftReceiveArt{},mysteryGiftReceivePulseArt{};
+    std::vector<NitroRgbaImage> mysteryGiftSignalCells;
+    NitroNanrBank mysteryGiftSignalAnim{};
     int newGameStage=0;
     int newGameGender=0;
     int newGameNameCursor=0;
@@ -1186,6 +1229,33 @@ struct NativeGame::Impl {
     void beginTransitionStep(){
         fromX=tx;fromY=ty;toX=fieldTransition.warp.x;toY=fieldTransition.warp.y;moveProgress=0.0f;
     }
+    bool beginStairTransition(const HgWarpEvent& w){
+        if(fieldTransition.active()||!romWorldReady)return false;
+        auto const* permission=romWorld.permissionAt(w.x,w.y);
+        const int stairDir=permission?hg_permission_stair_warp_direction(*permission):0;
+        if(stairDir==0)return false;
+        fieldTransition.clear();
+        fieldTransition.warp=w;
+        fieldTransition.sourceMap=romWorld.mapId();
+        fieldTransition.destinationMap=w.targetMap;
+        fieldTransition.stairWarp=true;
+        fieldTransition.stairDirection=stairDir;
+        fieldTransition.stairAmount=0.0f;
+        if(auto const* h=hg_map_header(w.targetMap)){
+            auto ev=load_hg_event_bank(assets,h->eventsBank);
+            if(ev.valid&&w.targetWarp<ev.warps.size()){
+                auto const& dw=ev.warps[w.targetWarp];
+                fieldTransition.destinationDoorX=dw.x;
+                fieldTransition.destinationDoorY=dw.y;
+            }
+        }
+        facing=stairDir>0?Dir::Right:Dir::Left;
+        fieldTransition.clock=0.0;
+        fieldTransition.fade=0.0f;
+        fieldTransition.phase=FieldTransition::Phase::StairSourceWalk;
+        return true;
+    }
+
     bool beginBuildingTransition(const HgWarpEvent& w,Dir d){
         if(fieldTransition.active()||!isBuildingTransition(w))return false;
         fieldTransition.clear();fieldTransition.warp=w;fieldTransition.sourceMap=romWorld.mapId();
@@ -1219,6 +1289,58 @@ struct NativeGame::Impl {
         using P=FieldTransition::Phase;
         constexpr double doorOpenSeconds=0.20,doorHoldSeconds=0.12,doorCloseSeconds=0.18,fadeOutSeconds=0.26,fadeInSeconds=0.30;
         if(!fieldTransition.active())return;
+        constexpr double stairSourceSeconds=0.20,stairDestinationSeconds=0.32,stairFadeOutSeconds=0.16,stairFadeInSeconds=0.20;
+        if(fieldTransition.phase==P::StairSourceWalk){
+            // The normal movement loop has already walked the player onto the
+            // authored stair-warp tile. Continue only a short distance into the
+            // staircase before fading; do not start a second full tile move.
+            fieldTransition.clock+=dt;
+            float q=float(std::clamp(fieldTransition.clock/stairSourceSeconds,0.0,1.0));
+            fieldTransition.stairAmount=q*q*(3.0f-2.0f*q);
+            if(fieldTransition.clock>=stairSourceSeconds){
+                fieldTransition.stairAmount=1.0f;fieldTransition.clock=0.0;fieldTransition.phase=P::StairFadeOut;
+            }
+            return;
+        }
+        if(fieldTransition.phase==P::StairFadeOut){
+            fieldTransition.clock+=dt;fieldTransition.fade=float(std::clamp(fieldTransition.clock/stairFadeOutSeconds,0.0,1.0));
+            if(fieldTransition.clock>=stairFadeOutSeconds){
+                fieldTransition.fade=1.0f;
+                // Stair transitions need the exact destination warp coordinate.
+                // Ordinary useWarpAt intentionally spawns a tile away, which made
+                // v0.46's destination animation start from the wrong location.
+                if(!romWorld.useWarpAtExact(fieldTransition.warp.x,fieldTransition.warp.y)){showToast("STAIR WARP FAILED");fieldTransition.clear();return;}
+                onMapEntered(true);showToast(romWorld.locationName());
+                int dd=0;if(auto const* dp=romWorld.permissionAt(tx,ty))dd=hg_permission_stair_warp_direction(*dp);
+                if(dd!=0)fieldTransition.stairDirection=dd;
+                // Prefer the authored direction, but never animate into a wall.
+                if(!romWorld.canMoveTo(tx+fieldTransition.stairDirection,ty)&&romWorld.canMoveTo(tx-fieldTransition.stairDirection,ty))fieldTransition.stairDirection=-fieldTransition.stairDirection;
+                facing=fieldTransition.stairDirection>0?Dir::Right:Dir::Left;
+                fieldTransition.stairAmount=0.0f;fieldTransition.clock=0.0;fieldTransition.phase=P::StairFadeIn;
+            }
+            return;
+        }
+        if(fieldTransition.phase==P::StairFadeIn){
+            fieldTransition.clock+=dt;fieldTransition.fade=1.0f-float(std::clamp(fieldTransition.clock/stairFadeInSeconds,0.0,1.0));
+            if(fieldTransition.clock>=stairFadeInSeconds){
+                fieldTransition.fade=0.0f;fieldTransition.clock=0.0;fieldTransition.phase=P::StairDestinationWalk;
+            }
+            return;
+        }
+        if(fieldTransition.phase==P::StairDestinationWalk){
+            fieldTransition.clock+=dt;
+            float q=float(std::clamp(fieldTransition.clock/stairDestinationSeconds,0.0,1.0));
+            fieldTransition.stairAmount=q*q*(3.0f-2.0f*q);
+            if(fieldTransition.clock>=stairDestinationSeconds){
+                fieldTransition.stairAmount=1.0f;
+                const int nx=tx+fieldTransition.stairDirection,ny=ty;
+                if(romWorld.canMoveTo(nx,ny)&&!npcAt(nx,ny)){
+                    romWorld.commitPosition(nx,ny);tx=nx;ty=ny;rx=float(tx);ry=float(ty);fromX=toX=tx;fromY=toY=ty;moveProgress=1.0f;gameState.onPlayerStep();
+                }
+                fieldTransition.clear();
+            }
+            return;
+        }
         if(fieldTransition.phase==P::DoorOpening){
             fieldTransition.clock+=dt;float q=float(std::clamp(fieldTransition.clock/doorOpenSeconds,0.0,1.0));q=q*q*(3.0f-2.0f*q);fieldTransition.doorAmount=q;
             if(fieldTransition.clock>=doorOpenSeconds){fieldTransition.doorAmount=1.0f;fieldTransition.clock=0.0;fieldTransition.phase=P::DoorOpenHold;}
@@ -1313,7 +1435,31 @@ struct NativeGame::Impl {
         for(auto const& c:romWorld.visibleChunks()){
             bool interior=false;if(auto* h=hg_map_header(c.mapId))interior=h->mapType==4;
             auto& cache=interior?romRoomBuildings:romFieldBuildings;auto const& arc=interior?roomArc:fieldArc;
-            for(auto const& b:c.land.buildings){int id=int(b.modelId);if(cache.find(id)==cache.end()){auto m=load_nsbmd_from_narc(arc,std::size_t(id));if(m.valid)cache.emplace(id,std::move(m));}}
+            auto& srtCache=interior?romRoomBuildingSrt:romFieldBuildingSrt;
+            auto& jntCache=interior?romRoomBuildingJnt:romFieldBuildingJnt;
+            const auto animationList=assets/(interior?"a/1/0/8":"a/1/0/7");
+            const auto animationArc=assets/"a/1/0/6";
+            for(auto const& b:c.land.buildings){
+                int id=int(b.modelId);
+                if(cache.find(id)==cache.end()){
+                    auto m=load_nsbmd_from_narc(arc,std::size_t(id));
+                    if(m.valid)cache.emplace(id,std::move(m));
+                }
+                if(srtCache.find(id)==srtCache.end()){
+                    auto a=load_build_model_nsbta(animationList,animationArc,std::size_t(id));
+                    // Cache misses as invalid objects too so maps with many copies
+                    // of a static prop do not re-open the NARCs every refresh.
+                    srtCache.emplace(id,std::move(a));
+                }
+                // Only the retail anemometer/turbine top (bm_field 291,
+                // a13_anemo) needs continuous BCA playback here. v0.46 loaded
+                // every build-model BCA and accidentally looped door animations.
+                const bool continuousWindRotor=(!interior&&(id==27||id==291));
+                if(continuousWindRotor&&jntCache.find(id)==jntCache.end()){
+                    auto a=load_build_model_nsbca(animationList,animationArc,std::size_t(id));
+                    jntCache.emplace(id,std::move(a));
+                }
+            }
         }
         for(auto const& o:romWorld.events().overworlds){
             if(!npcVisible(o))continue;
@@ -2505,7 +2651,13 @@ struct NativeGame::Impl {
         return continueRomScript();
     }
     void doWarpIfNeeded(){
-        if(romWorldReady){if(romWorld.processWarp()){onMapEntered(true);showToast(romWorld.locationName());}return;}
+        if(romWorldReady){
+            if(auto const* w=warpAt(tx,ty)){
+                if(auto const* p=romWorld.permissionAt(tx,ty);p&&hg_permission_stair_warp_direction(*p)!=0){beginStairTransition(*w);return;}
+            }
+            if(romWorld.processWarp()){onMapEntered(true);showToast(romWorld.locationName());}
+            return;
+        }
         for(auto const& w:map().warps) if(w.x==tx&&w.y==ty){ mapIndex=w.targetMap;tx=w.targetX;ty=w.targetY;rx=float(tx);ry=float(ty);fromX=toX=tx;fromY=toY=ty;moveProgress=1.0f;facing=w.targetFacing;showToast(maps[mapIndex].name);return; }
     }
     void tryMove(Dir d,bool run){
@@ -2668,6 +2820,87 @@ struct NativeGame::Impl {
         auto dm=newGameMessages.decode(id,gameState.playerName.empty()?"PLAYER":gameState.playerName);
         return dm.valid?dm.text:std::string{};
     }
+    void loadMysteryGiftRetailAssets(){
+        if(mysteryGiftAssetsTried)return;
+        mysteryGiftAssetsTried=true;
+        const auto arc=assets/"a/0/8/8"; // retail Mystery Gift application NARC (ID 88)
+        auto info=inspect_narc(arc);
+        if(!info.valid||info.members.size()<48)return;
+        auto member=[&](std::size_t i){return readNitro2dMember(arc,i);};
+        // Overlay 75's authored top/menu and receive layers.
+        mysteryGiftTopArt=decode_nitro_bg(member(11),member(12),member(3),false);
+        mysteryGiftMenuArt=decode_nitro_bg(member(19),member(24),member(20),false);
+        mysteryGiftReceiveArt=decode_nitro_bg(member(2),member(6),member(3),false);
+        mysteryGiftReceivePulseArt=decode_nitro_bg(member(2),member(8),member(3),true);
+        // The receive/search object layer has a real NCER cell bank and NANR
+        // animation. Sequence 2 is the retail four-frame pulsing/search cycle.
+        mysteryGiftSignalCells=decode_nitro_cells(member(9),member(1),member(10),true);
+        mysteryGiftSignalAnim=decode_nitro_nanr(member(0));
+        mysteryGiftRetailAssets=mysteryGiftTopArt.valid&&mysteryGiftMenuArt.valid&&mysteryGiftReceiveArt.valid;
+    }
+    void beginMysteryGift(){
+        loadMysteryGiftRetailAssets();
+        mysteryGiftConfig=hg_load_mystery_gift_config(savePath);
+        mysteryGiftStatus="PRESS ENTER TO CONNECT";
+        mysteryGiftDetail="ONLINE MYSTERY GIFT SERVICE READY";
+        mysteryGiftLoadedSave=false;
+        mysteryGiftAnimating=false;mysteryGiftClock=0.0;mysteryGiftAnimClock=0.0;
+        if(readSaveSummary().valid){
+            if(loadInternal()){
+                mysteryGiftLoadedSave=true;
+                // v0.44 moves the distribution identity into the actual save.
+                // Upgrade older saves before making any network request so deleting
+                // an external client-id file cannot reset redemption state.
+                if(gameState.mysteryGiftSaveId.empty()){
+                    gameState.mysteryGiftSaveId=hg_new_mystery_gift_save_id();
+                    if(!saveInternal()){
+                        mysteryGiftLoadedSave=false;
+                        mysteryGiftStatus="SAVE UPGRADE FAILED";
+                        mysteryGiftDetail="Could not store the one-time Mystery Gift identity in this save.";
+                    }
+                }
+                mysteryGiftClientId=gameState.mysteryGiftSaveId;
+            }
+        }
+        mode=Mode::MysteryGift;
+        // Retail overlay 75 starts SEQ 0x47D / 1149 for Mystery Gift.
+        playBgmSequence(SEQ_GS_MYSTERY_GIFT,0.18f);
+        if(!mysteryGiftLoadedSave&&mysteryGiftStatus!="SAVE UPGRADE FAILED"){
+            mysteryGiftStatus="NO VALID SAVE DATA";
+            mysteryGiftDetail="Create and save a game before receiving a Mystery Gift.";
+        }
+    }
+    void receiveMysteryGift(){
+        if(!mysteryGiftLoadedSave){mysteryGiftStatus="NO VALID SAVE DATA";return;}
+        if(gameState.mysteryGiftSaveId.empty()){
+            mysteryGiftStatus="SAVE ID MISSING";
+            mysteryGiftDetail="Save the game once before checking for a Mystery Gift.";
+            return;
+        }
+        mysteryGiftStatus="CONNECTING...";
+        // Send the save's redeemed event IDs to the server as well as using the
+        // save-bound client ID. Thus a server claims reset still cannot reissue
+        // an event already recorded in this save.
+        auto result=hg_fetch_mystery_gift(mysteryGiftConfig,gameState.mysteryGiftSaveId,gameState.playerName,gameState.mysteryGiftClaims);
+        if(!result.transportOk){mysteryGiftStatus="CONNECTION FAILED";mysteryGiftDetail=result.message;return;}
+        if(result.alreadyClaimed){mysteryGiftStatus="GIFT ALREADY RECEIVED";mysteryGiftDetail=result.message.empty()?"This Mystery Gift was already received by this save.":result.message;return;}
+        if(!result.hasGift){mysteryGiftStatus="NO GIFT AVAILABLE";mysteryGiftDetail=result.message;return;}
+        if(gameState.mysteryGiftClaims.count(result.gift.id)){mysteryGiftStatus="GIFT ALREADY RECEIVED";mysteryGiftDetail="This save already contains event "+result.gift.id+".";return;}
+        HgGameState before=gameState;std::string description;
+        if(!hg_apply_mystery_gift(gameState,result.gift,&description)){mysteryGiftStatus="COULD NOT RECEIVE GIFT";mysteryGiftDetail=description;return;}
+        // hg_apply_mystery_gift records the event ID in the same state mutation as
+        // the reward. The disk write therefore commits item/Pokemon + one-time
+        // redemption record transactionally; failure restores the pre-gift state.
+        if(!saveInternal()){gameState=std::move(before);scriptVm.bindState(&gameState);mysteryGiftStatus="SAVE FAILED";mysteryGiftDetail="The gift was not kept because the save could not be written.";return;}
+        std::string ackError;bool acked=hg_ack_mystery_gift(mysteryGiftConfig,gameState.mysteryGiftSaveId,result.gift.id,&ackError);
+        mysteryGiftStatus="GIFT RECEIVED!";
+        mysteryGiftDetail=(result.gift.title.empty()?description:result.gift.title+" - "+description);
+        if(!result.gift.message.empty())mysteryGiftDetail+="  "+result.gift.message;
+        if(!acked)mysteryGiftDetail+="  (Saved locally; server ACK pending: "+ackError+")";
+        // Play the ROM-authored Mystery Gift receive/search animation after the
+        // save has committed, matching retail's receive-feedback ordering.
+        mysteryGiftAnimating=true;mysteryGiftAnimClock=0.0;
+    }
     void beginNewGame(){
         gameState=HgGameState{}; gameState.playerName="ETHAN"; gameState.female=false; gameState.newGameStarted=true; gameState.momIntroDone=false; gameState.badges=0;
         scriptVm.bindState(&gameState); scriptVm.stop(); clearScriptHostState(); pendingMapScripts.clear(); frameScriptLatch=0; playSeconds=0; newGameStage=0; newGameGender=0; newGameNameCursor=0; newGameName.clear(); newGameClock=0; newGameStage=1; mode=Mode::NewGameIntro;
@@ -2696,11 +2929,15 @@ struct NativeGame::Impl {
     }
     bool saveInternal(){
         try {
+            // Every world save receives a stable Mystery Gift identity. It is part
+            // of the save, not the machine, so one-time events survive server/client
+            // metadata deletion just like retail save-bound event state.
+            if(romWorldReady&&gameState.mysteryGiftSaveId.empty())gameState.mysteryGiftSaveId=hg_new_mystery_gift_save_id();
             if(savePath.has_parent_path()) std::filesystem::create_directories(savePath.parent_path());
             std::ofstream o(savePath);
             if(!o)return false;
             if(romWorldReady){
-                o<<"HG_NATIVE_WORLD_V10\n"<<"map="<<romWorld.mapId()<<"\n"<<"x="<<romWorld.x()<<"\n"<<"y="<<romWorld.y()<<"\n"<<"facing="<<static_cast<int>(facing)<<"\n"<<std::fixed<<std::setprecision(3)<<"play="<<playSeconds<<"\n";
+                o<<"HG_NATIVE_WORLD_V12\n"<<"map="<<romWorld.mapId()<<"\n"<<"x="<<romWorld.x()<<"\n"<<"y="<<romWorld.y()<<"\n"<<"facing="<<static_cast<int>(facing)<<"\n"<<std::fixed<<std::setprecision(3)<<"play="<<playSeconds<<"\n";
                 o<<"name="<<gameState.playerName<<"\n"<<"rival="<<gameState.rivalName<<"\n"<<"friend="<<gameState.friendName<<"\n"<<"female="<<gameState.female<<"\n"<<"newgame="<<gameState.newGameStarted<<"\n"<<"momintro="<<gameState.momIntroDone<<"\n"<<"elmlabintro="<<gameState.elmLabIntroDone<<"\n"<<"gotstarter="<<gameState.gotStarter<<"\n"<<"badges="<<int(gameState.badges)<<"\n"<<"badgeflags="<<gameState.badgeFlags<<"\n";
                 o<<"money="<<gameState.money<<"\n"<<"momsavings="<<gameState.momSavings<<"\n"<<"photos="<<gameState.savedPhotos<<"\n"<<"coins="<<gameState.coins<<"\n"<<"athlete="<<gameState.athletePoints<<"\n"<<"pokeathlonprizes="<<gameState.pokeathlonPrizeFlags<<"\n"<<"pokeathloncards="<<gameState.pokeathlonDataCardFlags<<"\n"<<"pokeathlonday="<<gameState.pokeathlonPrizeDay<<"\n"<<"battlepoints="<<gameState.battlePoints<<"\n"<<"pokegearcards="<<gameState.pokegearCards<<"\n"<<"pokedex="<<gameState.pokedex<<"\n"<<"nationaldex="<<gameState.nationalDex<<"\n"<<"running="<<gameState.runningShoes<<"\n"<<"onbike="<<gameState.onBike<<"\n"<<"bikelocked="<<gameState.bikeLocked<<"\n"<<"escort="<<gameState.escortMode<<"\n"<<"gameclear="<<gameState.gameCleared<<"\n"<<"steptaken="<<gameState.stepTaken<<"\n"<<"strength="<<gameState.strengthActive<<"\n"<<"flash="<<gameState.flashActive<<"\n"<<"defog="<<gameState.defogActive<<"\n"<<"starter="<<gameState.starter<<"\n"<<"spawn="<<gameState.spawnId<<"\n";
                 o<<"follower="<<gameState.followerEnabled<<","<<int(gameState.followerPartySlot)<<","<<gameState.followerSpecies<<"\n";
@@ -2721,6 +2958,8 @@ struct NativeGame::Impl {
                 o<<"daycareegg="<<gameState.daycareEggReady<<","<<gameState.daycareEggSpecies<<"\n";
                 for(auto id:gameState.dexSeen)o<<"seen="<<id<<"\n";
                 for(auto id:gameState.dexOwned)o<<"owned="<<id<<"\n";
+                o<<"mysterygift_save_id="<<safe(gameState.mysteryGiftSaveId)<<"\n";
+                {std::vector<std::string> gifts(gameState.mysteryGiftClaims.begin(),gameState.mysteryGiftClaims.end());std::sort(gifts.begin(),gifts.end());for(auto const& id:gifts)o<<"mysterygift="<<safe(id)<<"\n";}
             }else o<<"HG_NATIVE_DEMO_V1\n"<<"map="<<mapIndex<<"\n"<<"x="<<tx<<"\n"<<"y="<<ty<<"\n"<<"facing="<<static_cast<int>(facing)<<"\n"<<std::fixed<<std::setprecision(3)<<"play="<<playSeconds<<"\n";
             return bool(o);
         }catch(...){return false;}
@@ -2770,15 +3009,15 @@ struct NativeGame::Impl {
             else if(k=="pcmon"){auto a=parts(v);HgMon m;if(parseMon(a,0,m))loaded.pcStorage.push_back(m);}
             else if(k=="daycare"){auto a=parts(v);if(a.size()>=20){auto slot=std::size_t(std::stoul(a[0]));if(slot<loaded.daycare.size()){HgMon m;if(parseMon(a,2,m)){loaded.daycare[slot].occupied=true;loaded.daycare[slot].steps=std::uint32_t(std::stoul(a[1]));loaded.daycare[slot].mon=std::move(m);}}}}
             else if(k=="daycareegg"){auto a=parts(v);if(a.size()>=2){loaded.daycareEggReady=std::stoi(a[0])!=0;loaded.daycareEggSpecies=std::uint16_t(std::stoul(a[1]));}}
-            else if(k=="seen")loaded.dexSeen.insert(std::uint16_t(std::stoul(v)));else if(k=="owned")loaded.dexOwned.insert(std::uint16_t(std::stoul(v)));
+            else if(k=="seen")loaded.dexSeen.insert(std::uint16_t(std::stoul(v)));else if(k=="owned")loaded.dexOwned.insert(std::uint16_t(std::stoul(v)));else if(k=="mysterygift_save_id"&&!v.empty())loaded.mysteryGiftSaveId=v;else if(k=="mysterygift"&&!v.empty())loaded.mysteryGiftClaims.insert(v);
         }catch(...){}}
         facing=static_cast<Dir>(std::clamp(nf,0,3));playSeconds=std::max(0.0,np);
-        if(version=="HG_NATIVE_WORLD_V2"||version=="HG_NATIVE_WORLD_V3"||version=="HG_NATIVE_WORLD_V4"||version=="HG_NATIVE_WORLD_V5"||version=="HG_NATIVE_WORLD_V6"||version=="HG_NATIVE_WORLD_V7"||version=="HG_NATIVE_WORLD_V8"||version=="HG_NATIVE_WORLD_V9"||version=="HG_NATIVE_WORLD_V10"){
+        if(version=="HG_NATIVE_WORLD_V2"||version=="HG_NATIVE_WORLD_V3"||version=="HG_NATIVE_WORLD_V4"||version=="HG_NATIVE_WORLD_V5"||version=="HG_NATIVE_WORLD_V6"||version=="HG_NATIVE_WORLD_V7"||version=="HG_NATIVE_WORLD_V8"||version=="HG_NATIVE_WORLD_V9"||version=="HG_NATIVE_WORLD_V10"||version=="HG_NATIVE_WORLD_V11"||version=="HG_NATIVE_WORLD_V12"){
             if(!romWorldReady||!romWorld.loadMap(nm,nx,ny))return false;
-            if(version=="HG_NATIVE_WORLD_V4"||version=="HG_NATIVE_WORLD_V5"||version=="HG_NATIVE_WORLD_V6"||version=="HG_NATIVE_WORLD_V7"||version=="HG_NATIVE_WORLD_V8"||version=="HG_NATIVE_WORLD_V9"||version=="HG_NATIVE_WORLD_V10")gameState=std::move(loaded);else{gameState.vars=std::move(loaded.vars);gameState.flags=std::move(loaded.flags);}
+            if(version=="HG_NATIVE_WORLD_V4"||version=="HG_NATIVE_WORLD_V5"||version=="HG_NATIVE_WORLD_V6"||version=="HG_NATIVE_WORLD_V7"||version=="HG_NATIVE_WORLD_V8"||version=="HG_NATIVE_WORLD_V9"||version=="HG_NATIVE_WORLD_V10"||version=="HG_NATIVE_WORLD_V11"||version=="HG_NATIVE_WORLD_V12")gameState=std::move(loaded);else{gameState.vars=std::move(loaded.vars);gameState.flags=std::move(loaded.flags);}
             // Older saves already containing a starter necessarily passed the lab
             // selection event; promote them into the explicit v6 story flags.
-            if(version!="HG_NATIVE_WORLD_V6"&&version!="HG_NATIVE_WORLD_V7"&&version!="HG_NATIVE_WORLD_V8"&&version!="HG_NATIVE_WORLD_V9"&&version!="HG_NATIVE_WORLD_V10"&&gameState.starter){gameState.gotStarter=true;gameState.elmLabIntroDone=true;}
+            if(version!="HG_NATIVE_WORLD_V6"&&version!="HG_NATIVE_WORLD_V7"&&version!="HG_NATIVE_WORLD_V8"&&version!="HG_NATIVE_WORLD_V9"&&version!="HG_NATIVE_WORLD_V10"&&version!="HG_NATIVE_WORLD_V11"&&version!="HG_NATIVE_WORLD_V12"&&gameState.starter){gameState.gotStarter=true;gameState.elmLabIntroDone=true;}
             // v0.11-v0.16 interpreted CheckFlag + GoToIf TRUE/FALSE with the
             // numeric comparison table.  A fresh pre-starter save could therefore
             // execute Elm's postgame S.S. Ticket branch and persist its flag/item.
@@ -2792,7 +3031,7 @@ struct NativeGame::Impl {
                 gameState.bag.erase(456);      // ITEM_S_S__TICKET
             }
             scriptVm.bindState(&gameState);scriptVm.stop();clearScriptHostState();nativeLabPhase=0;nativeDialogueAction=0;nativeStarterSelection=false;scriptedPlayerMoves.clear();fieldTransition.clear();onMapEntered(false);mode=Mode::Field;
-            std::string loadMsg="LEGACY WORLD SAVE LOADED";if(version=="HG_NATIVE_WORLD_V10")loadMsg="V10 BATTLE STATE LOADED";else if(version=="HG_NATIVE_WORLD_V9")loadMsg="V9 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V8")loadMsg="V8 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V7")loadMsg="V7 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V6")loadMsg="V6 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V5")loadMsg="V5 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V4")loadMsg="V4 GAME STATE LOADED";showToast(loadMsg);return true;
+            std::string loadMsg="LEGACY WORLD SAVE LOADED";if(version=="HG_NATIVE_WORLD_V12")loadMsg="V12 ONE-TIME MYSTERY GIFT SAVE LOADED";else if(version=="HG_NATIVE_WORLD_V11")loadMsg="V11 MYSTERY GIFT SAVE LOADED";else if(version=="HG_NATIVE_WORLD_V10")loadMsg="V10 BATTLE STATE LOADED";else if(version=="HG_NATIVE_WORLD_V9")loadMsg="V9 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V8")loadMsg="V8 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V7")loadMsg="V7 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V6")loadMsg="V6 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V5")loadMsg="V5 GAME STATE LOADED";else if(version=="HG_NATIVE_WORLD_V4")loadMsg="V4 GAME STATE LOADED";showToast(loadMsg);return true;
         }
         if(version!="HG_NATIVE_DEMO_V1"||nm<0||nm>=static_cast<int>(maps.size()))return false;
         mapIndex=nm;
@@ -2848,8 +3087,19 @@ struct NativeGame::Impl {
             if(input.wasPressed(GameButton::Interact)){
                 if(mainMenuIndex==0){if(!loadInternal())showToast("NO SAVE DATA");}
                 else if(mainMenuIndex==1)beginNewGame();
-                else showToast("MYSTERY GIFT - FUTURE CUSTOM SERVER");
+                else beginMysteryGift();
             }
+            return;
+        }
+        if(mode==Mode::MysteryGift){
+            mysteryGiftClock+=dt;
+            if(mysteryGiftAnimating){
+                mysteryGiftAnimClock+=dt;
+                if(mysteryGiftAnimClock>=3.20)mysteryGiftAnimating=false;
+                return;
+            }
+            if(input.wasPressed(GameButton::Menu)){mainMenuIndex=2;mode=Mode::MainMenu;playBgmSequence(SEQ_GS_TITLE,0.18f);return;}
+            if(input.wasPressed(GameButton::Interact)){receiveMysteryGift();return;}
             return;
         }
         if(mode==Mode::NewGameIntro){
@@ -3297,6 +3547,8 @@ struct NativeGame::Impl {
         for(auto const* cp:chunks){
             auto const& c=*cp;bool chunkInterior=false;if(auto* h=hg_map_header(c.mapId))chunkInterior=h->mapType==4;
             auto const& cache=chunkInterior?romRoomBuildings:romFieldBuildings;
+            auto const& srtCache=chunkInterior?romRoomBuildingSrt:romFieldBuildingSrt;
+            auto const& jntCache=chunkInterior?romRoomBuildingJnt:romFieldBuildingJnt;
             for(auto const& bp:c.land.buildings){
                 auto it=cache.find(int(bp.modelId));if(it==cache.end()||!it->second.valid||it->second.models.empty())continue;
                 float bx=hg_field_chunk_center(c.matrixX)+placeComponent(bp.x,bp.xFraction);
@@ -3321,8 +3573,12 @@ struct NativeGame::Impl {
                         doorYRotation=std::uint16_t((std::uint32_t(bp.yRotation)+std::uint32_t(extra))&0xffffu);
                     }
                 }
+                const NsbtaAnimation* buildSrt=nullptr;const NsbcaAnimation* buildJnt=nullptr;
+                if(auto ai=srtCache.find(int(bp.modelId));ai!=srtCache.end()&&ai->second.valid)buildSrt=&ai->second;
+                if(!chunkInterior&&(int(bp.modelId)==27||int(bp.modelId)==291))
+                    if(auto ai=jntCache.find(int(bp.modelId));ai!=jntCache.end()&&ai->second.valid)buildJnt=&ai->second;
                 preparePlacedNsbmdModel(preparedField,it->second.models.front(),&it->second.textures,bx,by,bz,camera,light,fieldAnimClock,currentDynamicTextureType,
-                    bp.xRotation,doorYRotation,bp.zRotation);
+                    bp.xRotation,doorYRotation,bp.zRotation,buildSrt,buildJnt);
             }
         }
 
@@ -3364,10 +3620,36 @@ struct NativeGame::Impl {
         }
 
         // Player uses the same depth buffer as world geometry, fixing building/tree
-        // faces incorrectly popping behind/in front of the sprite.
+        // faces incorrectly popping behind/in front of the sprite. Stair warps retain
+        // the authored map warp but visually walk the actor across the staircase on
+        // both sides of the fade instead of teleporting in one frame.
         const float jumpHeight=playerLedgeJump?0.16f*std::sin(std::clamp(moveProgress,0.0f,1.0f)*3.1415926535f):0.0f;
-        auto pp=projectWorldPoint({},hg_field_tile_center(rx),ph+0.05f+jumpHeight,hg_field_tile_center(ry),camera);
-        bool moving=moveProgress<1.0f;float playerScale=spriteScaleAtDepth(camera,pp[2]);
+        float playerRenderX=rx,playerRenderY=ry;
+        float playerHeight=ph;
+        bool stairMoving=false;
+        if(fieldTransition.active()&&fieldTransition.stairWarp){
+            using P=FieldTransition::Phase;
+            const bool sourceSide=fieldTransition.phase==P::StairSourceWalk||fieldTransition.phase==P::StairFadeOut;
+            const bool destinationSide=fieldTransition.phase==P::StairFadeIn||fieldTransition.phase==P::StairDestinationWalk;
+            const float dir=float(fieldTransition.stairDirection);
+            const float q=std::clamp(fieldTransition.stairAmount,0.0f,1.0f);
+            if(sourceSide){
+                // Only ease a fraction of a tile farther into the source stair.
+                playerRenderX=rx+dir*0.35f*q;
+                const float h0=romWorld.sampleHeightAt(tx,ty,ph*4.0f)/4.0f;
+                const float h1=romWorld.sampleHeightAt(tx+fieldTransition.stairDirection,ty,h0*4.0f)/4.0f;
+                playerHeight=h0+(h1-h0)*(0.35f*q);stairMoving=true;
+            }else if(destinationSide){
+                // Walk one real tile off the destination stair. Height is linearly
+                // interpolated between the authored BDHC tile samples; no fake hop.
+                playerRenderX=rx+dir*q;
+                const float h0=romWorld.sampleHeightAt(tx,ty,ph*4.0f)/4.0f;
+                const float h1=romWorld.sampleHeightAt(tx+fieldTransition.stairDirection,ty,h0*4.0f)/4.0f;
+                playerHeight=h0+(h1-h0)*q;stairMoving=true;
+            }
+        }
+        auto pp=projectWorldPoint({},hg_field_tile_center(playerRenderX),playerHeight+0.05f+jumpHeight,hg_field_tile_center(playerRenderY),camera);
+        bool moving=moveProgress<1.0f||stairMoving;float playerScale=spriteScaleAtDepth(camera,pp[2]);
         auto const& activePlayerSprite=(gameState.female&&heroineSprite.valid)?heroineSprite:playerSprite;if(activePlayerSprite.valid)rasterOverworldSprite(scene,activePlayerSprite,pp[0],pp[1]+playerScale*4.7f,pp[2],facing,moving,npcClock,light,playerScale);
         else drawCharacter(f,pp[0],pp[1]+18,facing,mul({0.22f,0.38f,0.72f,1},light),true);
 
@@ -3569,18 +3851,58 @@ struct NativeGame::Impl {
                 rect(f,(LW-w)/2,594,w,48,{0.03f,0.025f,0.02f,0.84f});
                 text(f,(LW-w)/2+28,608,2,promptText,{1.0f,0.96f,0.74f,1});
             }
-            text(f,22,682,1,"ENTER / A = START   ORIGINAL HEARTGOLD TITLE ASSETS   v0.24 HOUSE EXIT + OAK SPRITE FIX / NATIVE C++ / VULKAN",{0.98f,0.94f,0.82f,1},false);
+            text(f,22,682,1,"ENTER / A = START   HG/SS NATIVE PC PORT v0.46.5   NATIVE C++ / VULKAN",{0.98f,0.94f,0.82f,1},false);
             return f;
         }
         if(mode==Mode::MainMenu){
             RenderFrame f;f.clear={0.84f,0.88f,0.92f,1};rect(f,0,0,LW,LH,{0.76f,0.82f,0.88f,1});
             auto ss=readSaveSummary();
             rect(f,145,52,990,610,{0.95f,0.95f,0.91f,1});rect(f,160,67,960,580,{0.12f,0.16f,0.19f,1});
-            text(f,195,92,3,"POKEMON HEARTGOLD",{0.98f,0.80f,0.22f,1});
+            text(f,195,92,3,"POKEMON HEARTGOLD  v0.46.5",{0.98f,0.80f,0.22f,1});
             const char* fallback[3]={"CONTINUE","NEW GAME","MYSTERY GIFT"};
-            for(int i=0;i<3;i++){std::string label=fallback[i];if(mainMenuMessages.valid()){auto dm=mainMenuMessages.decode(i==0?0:(i==1?1:2));if(dm.valid&&!dm.text.empty())label=dm.text;}float y=185+i*126;bool disabled=(i==0&&!ss.valid)||i==2;Color box=disabled?Color{0.24f,0.27f,0.29f,1}:Color{0.22f,0.36f,0.42f,1};if(i==mainMenuIndex)box=disabled?Color{0.32f,0.34f,0.35f,1}:Color{0.55f,0.38f,0.08f,1};rect(f,210,y-20,860,92,box);text(f,250,y,3,std::string(i==mainMenuIndex?"> ":"  ")+label,disabled?Color{0.52f,0.55f,0.57f,1}:Color{1,1,1,1});if(i==2)text(f,746,y+10,1,"COMING LATER - CUSTOM SERVER",{0.50f,0.52f,0.54f,1});}
+            for(int i=0;i<3;i++){std::string label=fallback[i];if(mainMenuMessages.valid()){auto dm=mainMenuMessages.decode(i==0?0:(i==1?1:2));if(dm.valid&&!dm.text.empty())label=dm.text;}float y=185+i*126;bool disabled=(i==0&&!ss.valid)||(i==2&&!ss.valid);Color box=disabled?Color{0.24f,0.27f,0.29f,1}:Color{0.22f,0.36f,0.42f,1};if(i==mainMenuIndex)box=disabled?Color{0.32f,0.34f,0.35f,1}:Color{0.55f,0.38f,0.08f,1};rect(f,210,y-20,860,92,box);text(f,250,y,3,std::string(i==mainMenuIndex?"> ":"  ")+label,disabled?Color{0.52f,0.55f,0.57f,1}:Color{1,1,1,1});if(i==2)text(f,710,y+10,1,ss.valid?"CUSTOM SERVER - ENABLED":"CUSTOM SERVER - SAVE REQUIRED",ss.valid?Color{0.70f,0.88f,0.92f,1}:Color{0.50f,0.52f,0.54f,1});}
             if(ss.valid){int h=int(ss.play/3600),m=int(ss.play/60)%60;text(f,575,197,1,"PLAYER  "+ss.name,{0.82f,0.92f,1,1});text(f,575,220,1,"TIME    "+std::to_string(h)+":"+(m<10?"0":"")+std::to_string(m));text(f,780,220,1,"BADGES  "+std::to_string(ss.badges));text(f,575,243,1,"POKEDEX "+std::to_string(ss.dexOwned));}
             text(f,230,607,1,"ARROWS = SELECT   ENTER / A = CONFIRM   ESC / X = TITLE",{0.84f,0.88f,0.92f,1},false);return f;
+        }
+        if(mode==Mode::MysteryGift){
+            RenderFrame f;f.clear={0.04f,0.10f,0.18f,1};ensurePixels(f,f.clear);
+            if(mysteryGiftAnimating&&mysteryGiftRetailAssets){
+                // Native single-screen presentation of the retail DS receive scene.
+                // The actual NSCR/NCGR/NCLR layer is shown at 4:3, with the authored
+                // OAM/NANR object animation sampled at the DS 60 Hz rate.
+                constexpr int ax=280,ay=18,aw=720,ah=540;
+                blitImage(f,mysteryGiftReceiveArt,ax,ay,aw,ah,false);
+                if(mysteryGiftReceivePulseArt.valid&&(int(mysteryGiftAnimClock*7.5)&1)==0)
+                    blitImage(f,mysteryGiftReceivePulseArt,ax,ay,aw,ah,true);
+                if(!mysteryGiftSignalCells.empty()){
+                    std::size_t seq=mysteryGiftSignalAnim.valid&&mysteryGiftSignalAnim.sequences.size()>2?2:0;
+                    std::size_t ci=mysteryGiftSignalAnim.valid?sample_nitro_nanr_cell(mysteryGiftSignalAnim,seq,mysteryGiftAnimClock,60.0):std::size_t(mysteryGiftAnimClock*6.0)%mysteryGiftSignalCells.size();
+                    ci=std::min(ci,mysteryGiftSignalCells.size()-1);
+                    blitImage(f,mysteryGiftSignalCells[ci],ax,ay,aw,ah,true);
+                }
+                rect(f,210,575,860,96,{0.05f,0.11f,0.18f,0.94f});
+                text(f,385,598,3,"GIFT RECEIVED!",{1.0f,0.92f,0.58f,1});
+                text(f,265,642,1,mysteryGiftDetail,{0.92f,0.96f,1.0f,1});
+                if(mysteryGiftAnimClock<0.22)rect(f,0,0,LW,LH,{1,1,1,float(std::clamp(1.0-mysteryGiftAnimClock/0.22,0.0,1.0))});
+                if(mysteryGiftAnimClock>2.85)rect(f,0,0,LW,LH,{0,0,0,float(std::clamp((mysteryGiftAnimClock-2.85)/0.35,0.0,1.0))});
+                return f;
+            }
+            if(mysteryGiftRetailAssets){
+                // Preserve the two authored 256x192 DS screens side-by-side rather
+                // than stretching one DS screen over the PC window.
+                blitImage(f,mysteryGiftTopArt,45,42,560,420,false);
+                blitImage(f,mysteryGiftMenuArt,675,42,560,420,false);
+            }else{
+                rect(f,0,0,LW,LH,{0.76f,0.82f,0.88f,1});
+                rect(f,45,42,560,420,{0.08f,0.14f,0.20f,1});rect(f,675,42,560,420,{0.08f,0.14f,0.20f,1});
+                text(f,95,90,4,"MYSTERY GIFT",{0.98f,0.80f,0.22f,1});
+            }
+            rect(f,78,486,1124,166,{0.05f,0.11f,0.18f,0.95f});
+            text(f,112,510,3,mysteryGiftStatus,{1,1,1,1});
+            text(f,112,555,1,mysteryGiftDetail.empty()?"ONLINE MYSTERY GIFT SERVICE READY":mysteryGiftDetail,{0.82f,0.91f,0.96f,1});
+            text(f,112,591,1,"ONLINE SERVICE",{0.70f,0.82f,0.88f,1});
+            text(f,112,620,2,mysteryGiftLoadedSave?"ENTER / A = CHECK FOR GIFT    ESC / X = BACK":"A VALID SAVE IS REQUIRED",mysteryGiftLoadedSave?Color{0.98f,0.92f,0.62f,1}:Color{0.60f,0.62f,0.64f,1});
+            return f;
         }
         if(mode==Mode::NewGameIntro){
             RenderFrame f;f.clear={0.90f,0.95f,0.91f,1};ensurePixels(f,f.clear);

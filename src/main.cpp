@@ -180,7 +180,7 @@ int main(int argc,char** argv){
         NativeGame ng(assets,temp);bool okAssets=ng.validate();
         pulse(ng,GameButton::Interact); // intro -> title
         pulse(ng,GameButton::Interact); // title -> main menu (NEW GAME selected without save)
-        auto menuFrame=ng.render();bool menuOk=frameHasText(menuFrame,"NEW GAME")&&frameHasText(menuFrame,"MYSTERY GIFT")&&frameHasText(menuFrame,"CUSTOM SERVER");
+        auto menuFrame=ng.render();bool menuOk=frameHasText(menuFrame,"NEW GAME")&&frameHasText(menuFrame,"MYSTERY GIFT")&&frameHasText(menuFrame,"CUSTOM SERVER")&&frameHasText(menuFrame,"v0.46.5");
         pulse(ng,GameButton::Interact); // enter new-game sequence: Oak must be first
         auto oakFirst=ng.render();bool oakFirstOk=!oakFirst.texts.empty()&&!frameHasText(oakFirst,"PC-PORT TEASER");
         // Advance Oak through gender confirmation and into the name-entry grid.
@@ -332,6 +332,8 @@ int main(int argc,char** argv){
         auto doorScale=load_nsbmd_from_narc(assets/"fielddata/build_model/bm_field.narc",26);
         auto signScale=load_nsbmd_from_narc(assets/"fielddata/build_model/bm_field.narc",29);
         auto scaleOf=[](const NsbmdMember& m){return (m.valid&&!m.models.empty())?m.models.front().normalizedScale:-1.0f;};
+        // v0.46.1 restores the proven v0.45 scale path for ordinary props;
+        // only a13_anemo uses separated POSSCALE/joint translation handling.
         bool scaleOk=std::fabs(scaleOf(labScale)-0.25f)<0.001f&&std::fabs(scaleOf(doorScale)-0.0625f)<0.001f&&std::fabs(scaleOf(signScale)-0.0625f)<0.001f;
         std::cout<<"PLACED MODEL SCALE: lab="<<scaleOf(labScale)<<" door="<<scaleOf(doorScale)<<" sign="<<scaleOf(signScale)<<" expected 0.25 / 0.0625 / 0.0625 => "<<(scaleOk?"PASS":"FAIL")<<"\n";
         std::cout<<"FIELD NSBMD: "<<field.parsedMembers<<"/"<<field.members<<" members, "<<field.models<<" models, "<<field.triangles<<" triangles, "<<field.textures<<" textures, failures="<<field.failures<<"\n";
@@ -405,6 +407,6 @@ int main(int argc,char** argv){
         setenv("HG_DISABLE_CONTROLLER","1",1);
 #endif
     }
-    VulkanXcbRenderer r; if(!r.init(1280,720,"Pokemon HeartGold - Native Vulkan v0.32 Battle + Audio Fix"))return 4;
+    VulkanXcbRenderer r; if(!r.init(1280,720,"Pokemon HeartGold - Native Vulkan v0.46.5"))return 4;
     return r.run(game);
 }

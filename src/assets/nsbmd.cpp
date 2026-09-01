@@ -2,9 +2,11 @@
 #include "assets/narc.hpp"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -41,6 +43,7 @@ struct InfoBlock { std::vector<uint32_t> datum; std::vector<std::string> names; 
 InfoBlock info32(const Bytes& b,size_t p){auto raw=infoRaw(b,p,4);InfoBlock out;out.names=std::move(raw.names);for(auto const& d:raw.datum)out.datum.push_back(uint32_t(d[0])|(uint32_t(d[1])<<8)|(uint32_t(d[2])<<16)|(uint32_t(d[3])<<24));return out;}
 
 struct Material {
+    std::string name;
     Color diffuse{1,1,1,1};
     Color ambient{1,1,1,1};
     Color emission{0,0,0,1};
@@ -90,6 +93,7 @@ std::vector<Material> readMaterials(const Bytes& b,size_t modelBase,size_t off,c
         uint32_t rel=ib.datum[i];size_t p=base+rel;if(p+24>b.size())throw std::runtime_error("material out of range");
         uint32_t difamb=rd32(b,p+4);uint32_t speemi=rd32(b,p+8);uint32_t poly=rd32(b,p+12);uint32_t texParams=rd32(b,p+20);float a=float((poly>>16)&31)/31.0f;
         Material m;
+        if(i<ib.names.size())m.name=ib.names[i];
         m.diffuse=rgb555(difamb&0x7fff,a);
         m.ambient=rgb555((difamb>>16)&0x7fff,1.0f);
         m.emission=rgb555((speemi>>16)&0x7fff,1.0f);
@@ -140,6 +144,23 @@ Vec3f transformNormal(const Mat4f& m,Vec3f v){
             m.m[8]*v.x+m.m[9]*v.y+m.m[10]*v.z};
     float n=std::sqrt(o.x*o.x+o.y*o.y+o.z*o.z);if(n>1e-8f){o.x/=n;o.y/=n;o.z/=n;}return o;
 }
+NsbmdMatrix toPublic(const Mat4f& m){NsbmdMatrix o{};for(int i=0;i<16;i++)o[std::size_t(i)]=m.m[i];return o;}
+Mat4f fromPublic(const NsbmdMatrix& m){Mat4f o{};for(int i=0;i<16;i++)o.m[i]=m[std::size_t(i)];return o;}
+Mat4f inverseAffine(const Mat4f& m){
+    // Invert the upper 3x3 and translation; Nitro joint matrices are affine.
+    const float a=m.m[0],b=m.m[1],c=m.m[2],d=m.m[4],e=m.m[5],f=m.m[6],g=m.m[8],h=m.m[9],i=m.m[10];
+    const float det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+    if(std::fabs(det)<1e-9f)return Mat4f::identity();
+    const float q=1.0f/det;Mat4f r=Mat4f::identity();
+    r.m[0]=(e*i-f*h)*q;r.m[1]=(c*h-b*i)*q;r.m[2]=(b*f-c*e)*q;
+    r.m[4]=(f*g-d*i)*q;r.m[5]=(a*i-c*g)*q;r.m[6]=(c*d-a*f)*q;
+    r.m[8]=(d*h-e*g)*q;r.m[9]=(b*g-a*h)*q;r.m[10]=(a*e-b*d)*q;
+    const float tx=m.m[3],ty=m.m[7],tz=m.m[11];
+    r.m[3]=-(r.m[0]*tx+r.m[1]*ty+r.m[2]*tz);
+    r.m[7]=-(r.m[4]*tx+r.m[5]*ty+r.m[6]*tz);
+    r.m[11]=-(r.m[8]*tx+r.m[9]*ty+r.m[10]*tz);
+    return r;
+}
 float fx16s(uint16_t x){return float(int16_t(x))/4096.0f;}
 float fx32s(uint32_t x){return float(int32_t(x))/4096.0f;}
 Mat4f pivotMatrix(unsigned select,unsigned neg,float a,float b){
@@ -186,20 +207,24 @@ std::vector<Mat4f> readInvBinds(const Bytes& b,size_t modelBase,size_t off,size_
         m.m[8]=v[2];m.m[9]=v[5];m.m[10]=v[8];m.m[11]=v[11];out.push_back(m);}
     return out;
 }
-struct DrawState {int piece=0,material=0;Mat4f current=Mat4f::identity();std::array<Mat4f,32> stack{};};
-std::vector<DrawState> renderDraws(const Bytes& b,size_t base,size_t off,size_t pieceCount,const std::vector<Mat4f>& objects,const std::vector<Mat4f>& invBinds,float upScale,float downScale){
-    std::vector<DrawState> out;size_t p=base+off;int mat=0;size_t guard=0;Mat4f cur=Mat4f::identity();std::array<Mat4f,32> stack{};for(auto& x:stack)x=Mat4f::identity();
+struct DrawState {int piece=0,material=0,joint=-1;Mat4f current=Mat4f::identity();std::array<Mat4f,32> stack{};};
+std::vector<DrawState> renderDraws(const Bytes& b,size_t base,size_t off,size_t pieceCount,const std::vector<Mat4f>& objects,const std::vector<Mat4f>& invBinds,float upScale,float downScale,std::vector<Mat4f>* jointWorld=nullptr,std::vector<int>* jointParents=nullptr,bool applySbcScale=false){
+    std::vector<DrawState> out;size_t p=base+off;int mat=0,activeJoint=-1;size_t guard=0;Mat4f cur=Mat4f::identity();std::array<Mat4f,32> stack{};for(auto& x:stack)x=Mat4f::identity();
+    if(jointWorld){jointWorld->assign(objects.size(),Mat4f::identity());}if(jointParents){jointParents->assign(objects.size(),-1);}
     auto params=[&](uint8_t op)->size_t{switch(op){case 0x00:case 0x01:case 0x0b:case 0x2b:case 0x40:case 0x80:return 0;case 0x03:case 0x04:case 0x05:case 0x07:case 0x08:case 0x24:case 0x44:return 1;case 0x02:case 0x0c:case 0x0d:case 0x47:return 2;case 0x06:return 3;case 0x26:case 0x46:return 4;case 0x66:return 5;default:return size_t(-1);}};
     while(p<b.size()&&guard++<100000){uint8_t op=b[p++];if(op==0x01)break;
         if(op==0x09){if(p+2>b.size())throw std::runtime_error("skin render command truncated");unsigned dst=b[p],count=b[p+1];size_t n=2+3ull*count;if(p+n>b.size())throw std::runtime_error("skin render command params truncated");Mat4f sum{};for(unsigned i=0;i<count;i++){unsigned sp=b[p+2+3*i],ib=b[p+3+3*i];float w=float(b[p+4+3*i])/256.0f;if(sp<stack.size()&&ib<invBinds.size())sum=maddScaled(sum,mmul(stack[sp],invBinds[ib]),w);}if(dst<stack.size())stack[dst]=sum;cur=sum;p+=n;continue;}
         size_t n=params(op);if(n==size_t(-1))throw std::runtime_error("unknown model render opcode");if(p+n>b.size())throw std::runtime_error("model render command truncated");const unsigned char* q=b.data()+p;
         if(op==0x03&&q[0]<stack.size())cur=stack[q[0]];
         else if(op==0x04||op==0x24||op==0x44)mat=q[0];
-        else if(op==0x05&&q[0]<pieceCount){DrawState d;d.piece=q[0];d.material=mat;d.current=cur;d.stack=stack;out.push_back(std::move(d));}
-        else if(op==0x06||op==0x26||op==0x46||op==0x66){unsigned obj=q[0];std::optional<unsigned> store,load;if(op==0x26)store=q[3];else if(op==0x46)load=q[3];else if(op==0x66){store=q[3];load=q[4];}if(load&&*load<stack.size())cur=stack[*load];if(obj<objects.size())cur=mmul(cur,objects[obj]);if(store&&*store<stack.size())stack[*store]=cur;}
-        // Keep the legacy normalizedScale path for world placement. Applying Nitro's
-        // global up/down scale here as well would double-scale field models.
-        else if(op==0x0b||op==0x2b){(void)upScale;(void)downScale;}
+        else if(op==0x05&&q[0]<pieceCount){DrawState d;d.piece=q[0];d.material=mat;d.joint=activeJoint;d.current=cur;d.stack=stack;out.push_back(std::move(d));}
+        else if(op==0x06||op==0x26||op==0x46||op==0x66){unsigned obj=q[0],parent=q[1];std::optional<unsigned> store,load;if(op==0x26)store=q[3];else if(op==0x46)load=q[3];else if(op==0x66){store=q[3];load=q[4];}if(load&&*load<stack.size())cur=stack[*load];if(obj<objects.size()){cur=mmul(cur,objects[obj]);activeJoint=int(obj);if(jointWorld&&obj<jointWorld->size())(*jointWorld)[obj]=cur;if(jointParents&&obj<jointParents->size())(*jointParents)[obj]=(parent==obj)?-1:int(parent);}if(store&&*store<stack.size())stack[*store]=cur;}
+        // Preserve the v0.45 scale path for ordinary HG/SS field/room models.
+        // The turbine/anemometer is the one confirmed model whose joint translation
+        // must remain outside POSSCALE; applying this globally changed world scale,
+        // lighting and several door props. The parser opts this in only for that model.
+        else if(op==0x0b){if(applySbcScale)cur=mmul(cur,mscale(upScale,upScale,upScale));}
+        else if(op==0x2b){if(applySbcScale)cur=mmul(cur,mscale(downScale,downScale,downScale));}
         p+=n;
     }
     if(out.empty())for(size_t i=0;i<pieceCount;i++){DrawState d;d.piece=int(i);d.material=0;d.current=Mat4f::identity();d.stack=stack;out.push_back(std::move(d));}
@@ -209,11 +234,19 @@ std::vector<DrawState> renderDraws(const Bytes& b,size_t base,size_t off,size_t 
 struct VState { Vec3f pos{}; Vec3f normal{0,1,0}; Vec2f uv{}; Color color{1,1,1,1}; Mat4f matrix=Mat4f::identity(); };
 std::vector<NsbmdTriangle> decodePiece(const Piece& pc,const Material& material,int materialIndex,const DrawState& draw){
     const auto& b=pc.commands;size_t p=0;std::array<uint8_t,4> fifo{};int fi=4;VState st;st.matrix=draw.current;int prim=-1;std::vector<NsbmdVertex> pv;std::vector<NsbmdTriangle> tris;
+    // Several HG/SS room props (plants, tables, chairs and shelves) deliberately
+    // use black diffuse + white ambient on an unlit, textured material. The DS
+    // field renderer treats those textures as the authored color source. The
+    // native decoder previously multiplied the texture by black twice, turning
+    // otherwise-valid furniture textures completely black.
+    const auto lum=[](Color c){return (c.r+c.g+c.b)/3.0f;};
+    const bool textureIsColorSource=material.textureIndex>=0&&!material.lightingEnabled&&
+        lum(material.diffuse)<0.06f&&lum(material.ambient)>0.75f;
     auto nparams=[](uint8_t op)->int{switch(op){case 0x00:return 0;case 0x14:return 1;case 0x1b:return 3;case 0x20:case 0x21:case 0x22:return 1;case 0x23:return 2;case 0x24:case 0x25:case 0x26:case 0x27:case 0x28:return 1;case 0x40:return 1;case 0x41:return 0;default:return -1;}};
     auto emitTri=[&](size_t a,size_t c,size_t d){if(a>=pv.size()||c>=pv.size()||d>=pv.size())return;NsbmdTriangle t;
         t.a=pv[a];t.b=pv[c];t.c=pv[d];
-        t.materialColor=material.diffuse;t.materialIndex=materialIndex;t.textureIndex=material.textureIndex;t.paletteIndex=material.paletteIndex;
-        t.ambientColor=material.ambient;t.emissionColor=material.emission;t.polygonAttr=material.polygonAttr;t.texImageParams=material.texImageParams;t.lightingEnabled=material.lightingEnabled;
+        t.materialColor=textureIsColorSource?Color{1,1,1,material.diffuse.a}:material.diffuse;t.materialIndex=materialIndex;t.textureIndex=material.textureIndex;t.paletteIndex=material.paletteIndex;
+        t.ambientColor=material.ambient;t.emissionColor=material.emission;t.polygonAttr=material.polygonAttr;t.texImageParams=material.texImageParams;t.lightingEnabled=material.lightingEnabled;t.jointIndex=draw.joint;
         {
             Vec3f e1{t.b.position.x-t.a.position.x,t.b.position.y-t.a.position.y,t.b.position.z-t.a.position.z};
             Vec3f e2{t.c.position.x-t.a.position.x,t.c.position.y-t.a.position.y,t.c.position.z-t.a.position.z};
@@ -231,7 +264,7 @@ std::vector<NsbmdTriangle> decodePiece(const Piece& pc,const Material& material,
         }
         tris.push_back(t);};
     auto flush=[&](){if(prim==0){for(size_t i=0;i+2<pv.size();i+=3)emitTri(i,i+1,i+2);}else if(prim==1){for(size_t i=0;i+3<pv.size();i+=4){emitTri(i,i+1,i+2);emitTri(i,i+2,i+3);}}else if(prim==2){for(size_t i=2;i<pv.size();i++){if(i&1)emitTri(i-1,i-2,i);else emitTri(i-2,i-1,i);}}else if(prim==3){for(size_t i=2;i+1<pv.size();i+=2){emitTri(i-2,i-1,i+1);emitTri(i-2,i+1,i);}}pv.clear();};
-    auto addVertex=[&](){NsbmdVertex v;v.position=transformPoint(st.matrix,st.pos);v.normal=transformNormal(st.matrix,st.normal);v.uv=st.uv;v.color=material.vertexDefault?cmul(st.color,material.diffuse):st.color;pv.push_back(v);};
+    auto addVertex=[&](){NsbmdVertex v;v.position=transformPoint(st.matrix,st.pos);v.normal=transformNormal(st.matrix,st.normal);v.uv=st.uv;v.color=(material.vertexDefault&&!textureIsColorSource)?cmul(st.color,material.diffuse):st.color;pv.push_back(v);};
     while(p<b.size()||fi<4){if(fi>=4){if(p+4>b.size())throw std::runtime_error("gpu opcode packet truncated");for(int i=0;i<4;i++)fifo[i]=b[p+i];p+=4;fi=0;}uint8_t op=fifo[fi++];int np=nparams(op);if(np<0)throw std::runtime_error("unsupported GPU opcode");if(p+4ull*np>b.size())throw std::runtime_error("gpu params truncated");uint32_t q0=np?rd32(b,p):0,q1=np>1?rd32(b,p+4):0,q2=np>2?rd32(b,p+8):0;p+=4ull*np;
         switch(op){
             case 0x14:if((q0&31)<draw.stack.size())st.matrix=draw.stack[q0&31];break;
@@ -398,17 +431,25 @@ NsbmdMember parse_nsbmd(const std::vector<unsigned char>& b){
             NsbmdModel model;
             model.name=modelList.names[mi];
             model.sourcePieces=pieces.size();
-            // Model header position scale. The HG/SS field coordinate system
-            // uses the terrain model's upScale=64 as our normalized 1.0.
-            // Respecting this per-model value fixes small props (doors/signs)
-            // that were previously enlarged by the old hard-coded 0.25 scale.
+            // Keep the proven v0.45 world normalization for all ordinary models.
+            // a13_anemo (the visible wind-turbine top) is the narrow exception: its
+            // mast geometry is POSSCALE'd while the rotor joint translation is not.
             auto fixed20_12=[&](size_t p)->float{return static_cast<int32_t>(rd32(b,p))/4096.0f;};
             model.upScale=fixed20_12(base+28);
             model.downScale=fixed20_12(base+32);
-            model.normalizedScale=(std::isfinite(model.upScale)&&model.upScale>0.0f)?model.upScale/64.0f:1.0f;
-            auto draws=renderDraws(b,base,renderOff,pieces.size(),objects,invBinds,model.upScale,model.downScale);
-            model.materialTextureNames.reserve(mats.size());model.materialPaletteNames.reserve(mats.size());
-            for(auto const& mm:mats){model.materialTextureNames.push_back(mm.textureName);model.materialPaletteNames.push_back(mm.paletteName);}
+            // v0.46.4: both retail wind-generator models use POSSCALE around the
+            // mast geometry while their animated rotor joint translations remain in
+            // the unscaled Nitro joint space.  v0.46.1 only exempted a13_anemo,
+            // which broke New Bark's wk_sp1 rotor when its BCA was restored.
+            const bool separatedJointScale=(model.name=="a13_anemo"||model.name=="wk_sp1");
+            model.normalizedScale=separatedJointScale?(1.0f/64.0f):((std::isfinite(model.upScale)&&model.upScale>0.0f)?model.upScale/64.0f:1.0f);
+            std::vector<Mat4f> jointWorld;std::vector<int> jointParents;
+            auto draws=renderDraws(b,base,renderOff,pieces.size(),objects,invBinds,model.upScale,model.downScale,&jointWorld,&jointParents,separatedJointScale);
+            model.jointLocalMatrices.reserve(objects.size());for(auto const& m:objects)model.jointLocalMatrices.push_back(toPublic(m));
+            model.jointBindWorldMatrices.reserve(jointWorld.size());for(auto const& m:jointWorld)model.jointBindWorldMatrices.push_back(toPublic(m));
+            model.jointParents=std::move(jointParents);
+            model.materialNames.reserve(mats.size());model.materialTextureNames.reserve(mats.size());model.materialPaletteNames.reserve(mats.size());
+            for(auto const& mm:mats){model.materialNames.push_back(mm.name);model.materialTextureNames.push_back(mm.textureName);model.materialPaletteNames.push_back(mm.paletteName);}
 
             for(auto const& draw:draws){
                 int pi=draw.piece,ma=draw.material;
@@ -442,9 +483,235 @@ void bind_nsbmd_external_textures(NsbmdMember& modelMember,const NsbmdMember& te
             if(mi<model.materialPaletteNames.size()){
                 auto const& n=model.materialPaletteNames[mi];for(size_t pi=0;pi<modelMember.paletteNames.size();pi++)if(modelMember.paletteNames[pi]==n){tri.paletteIndex=int(pi);break;}
             }
+            // v0.46 applied the room-prop black-material workaround to every
+            // externally textured land material, which flattened/broke field lighting.
+            // Restrict it to authored staircase materials; ordinary terrain keeps the
+            // exact v0.45 material/lighting result.
+            bool stairMaterial=false;
+            if(mi<model.materialNames.size()){
+                std::string n=model.materialNames[mi];
+                for(char& c:n)c=char(std::tolower(static_cast<unsigned char>(c)));
+                stairMaterial=n.find("stair")!=std::string::npos||n.find("kaidan")!=std::string::npos;
+            }
+            const auto lum=[](Color c){return (c.r+c.g+c.b)/3.0f;};
+            if(stairMaterial&&tri.textureIndex>=0&&!tri.lightingEnabled&&lum(tri.materialColor)<0.06f&&lum(tri.ambientColor)>0.75f){
+                tri.materialColor={1,1,1,tri.materialColor.a};
+                if(lum(tri.a.color)<0.06f)tri.a.color={1,1,1,tri.a.color.a};
+                if(lum(tri.b.color)<0.06f)tri.b.color={1,1,1,tri.b.color.a};
+                if(lum(tri.c.color)<0.06f)tri.c.color={1,1,1,tri.c.color.a};
+                Color vc{(tri.a.color.r+tri.b.color.r+tri.c.color.r)/3.0f,(tri.a.color.g+tri.b.color.g+tri.c.color.g)/3.0f,(tri.a.color.b+tri.b.color.b+tri.c.color.b)/3.0f,1};
+                tri.rasterBaseColor={vc.r,vc.g,vc.b,tri.materialColor.a};
+            }
         }
     }
 }
+
+
+NsbtaAnimation parse_nsbta(const std::vector<unsigned char>& b){
+    NsbtaAnimation out;
+    try{
+        if(b.size()<24||std::memcmp(b.data(),"BTA0",4))throw std::runtime_error("not BTA0");
+        const unsigned sections=rd16(b,14);
+        size_t srt=0;
+        for(unsigned i=0;i<sections;i++){
+            const size_t o=rd32(b,16+4ull*i);
+            if(o+8<=b.size()&&!std::memcmp(b.data()+o,"SRT0",4)){srt=o;break;}
+        }
+        if(!srt)throw std::runtime_error("BTA0 has no SRT0 section");
+        auto animations=info32(b,srt+8);
+        if(animations.datum.empty())throw std::runtime_error("SRT0 has no material animation");
+        // HG/SS build-model animation members use one animation per target model.
+        // Parse the first animation and all material tracks it contains.
+        const size_t base=srt+animations.datum.front();
+        if(base+16>b.size())throw std::runtime_error("material animation truncated");
+        out.frameCount=rd16(b,base+4);
+        auto tracks=infoRaw(b,base+8,40);
+        out.tracks.reserve(tracks.datum.size());
+        auto readTranslation=[&](const std::vector<unsigned char>& d,size_t channelOffset)->std::vector<float>{
+            std::vector<float> values;
+            if(channelOffset+8>d.size())return values;
+            const std::uint16_t count=std::uint16_t(d[channelOffset])|(std::uint16_t(d[channelOffset+1])<<8);
+            const std::uint8_t flags=d[channelOffset+3];
+            const std::uint32_t raw=std::uint32_t(d[channelOffset+4])|(std::uint32_t(d[channelOffset+5])<<8)|
+                                    (std::uint32_t(d[channelOffset+6])<<16)|(std::uint32_t(d[channelOffset+7])<<24);
+            if(flags==0x10){
+                const size_t p=base+raw;
+                if(p+2ull*count>b.size())throw std::runtime_error("SRT translation samples truncated");
+                values.reserve(count);
+                for(std::uint16_t i=0;i<count;i++)values.push_back(float(int16_t(rd16(b,p+2ull*i)))/32.0f);
+            }else{
+                // Constant SRT channels are stored inline as fixed-point values.
+                // Translation is expressed in the same texel-coordinate units as
+                // NSBMD TEXCOORD. Keep a single value and reuse it for every frame.
+                values.push_back(float(static_cast<std::int32_t>(raw))/4096.0f);
+            }
+            return values;
+        };
+        for(size_t i=0;i<tracks.datum.size();i++){
+            NsbtaMaterialTrack t;
+            if(i<tracks.names.size())t.materialName=tracks.names[i];
+            t.uTranslation=readTranslation(tracks.datum[i],24);
+            t.vTranslation=readTranslation(tracks.datum[i],32);
+            out.tracks.push_back(std::move(t));
+        }
+        out.valid=true;
+    }catch(const std::exception& e){out.error=e.what();}
+    return out;
+}
+
+NsbtaAnimation load_nsbta_from_narc(const std::filesystem::path& path,std::size_t index){
+    auto b=read_narc_member(path,index);
+    if(b.empty()){NsbtaAnimation o;o.error="NARC member missing";return o;}
+    return parse_nsbta(b);
+}
+
+NsbtaAnimation load_build_model_nsbta(const std::filesystem::path& animationListNarc,const std::filesystem::path& animationNarc,std::size_t modelIndex){
+    auto list=read_narc_member(animationListNarc,modelIndex);
+    NsbtaAnimation none;
+    if(list.size()<12){none.error="build-model animation list missing";return none;}
+    // HG/SS's 24-byte bm_*_anime_list entries store up to four archive member
+    // references beginning at byte 8. Different references can be BCA/BTP/BTA;
+    // select the first actual BTA0 member instead of assuming an animation type.
+    for(size_t p=8;p+4<=list.size()&&p<24;p+=4){
+        const std::uint32_t ref=std::uint32_t(list[p])|(std::uint32_t(list[p+1])<<8)|
+                                (std::uint32_t(list[p+2])<<16)|(std::uint32_t(list[p+3])<<24);
+        if(ref==0xffffffffu)continue;
+        auto bytes=read_narc_member(animationNarc,ref);
+        if(bytes.size()>=4&&!std::memcmp(bytes.data(),"BTA0",4)){
+            auto a=parse_nsbta(bytes);
+            if(a.valid)return a;
+        }
+    }
+    none.error="no NSBTA animation for build model";
+    return none;
+}
+
+Vec2f sample_nsbta_uv(const NsbtaAnimation& animation,const std::string& materialName,double seconds,double framesPerSecond){
+    if(!animation.valid||animation.frameCount==0||materialName.empty())return {};
+    const std::uint64_t absoluteFrame=std::uint64_t(std::max(0.0,std::floor(seconds*framesPerSecond)));
+    const std::size_t frame=std::size_t(absoluteFrame%animation.frameCount);
+    for(auto const& track:animation.tracks){
+        if(track.materialName!=materialName)continue;
+        auto sample=[frame](const std::vector<float>& v){
+            if(v.empty())return 0.0f;
+            if(v.size()==1)return v.front();
+            return v[std::min(frame,v.size()-1)];
+        };
+        return {sample(track.uTranslation),sample(track.vTranslation)};
+    }
+    return {};
+}
+
+
+NsbcaAnimation parse_nsbca(const std::vector<unsigned char>& b){
+    NsbcaAnimation out;
+    try{
+        if(b.size()<24||std::memcmp(b.data(),"BCA0",4))throw std::runtime_error("not BCA0");
+        const unsigned sections=rd16(b,14);size_t jnt=0;
+        for(unsigned i=0;i<sections;i++){const size_t o=rd32(b,16+4ull*i);if(o+8<=b.size()&&!std::memcmp(b.data()+o,"JNT0",4)){jnt=o;break;}}
+        if(!jnt)throw std::runtime_error("BCA0 has no JNT0 section");
+        auto animations=info32(b,jnt+8);if(animations.datum.empty())throw std::runtime_error("JNT0 has no animation");
+        const size_t base=jnt+animations.datum.front();
+        if(base+20>b.size()||std::memcmp(b.data()+base,"J\0AC",4))throw std::runtime_error("joint animation header invalid");
+        out.frameCount=rd16(b,base+4);const std::uint16_t objectCount=rd16(b,base+6);
+        const size_t pivotBase=base+rd32(b,base+12),basisBase=base+rd32(b,base+16);
+        if(!out.frameCount||base+20+2ull*objectCount>b.size())throw std::runtime_error("joint animation truncated");
+        struct M3{float v[9]{};};
+        auto identity3=[](){M3 m{};m.v[0]=m.v[4]=m.v[8]=1.0f;return m;};
+        auto fetchRotation=[&](std::uint16_t ref)->M3{
+            if(ref&0x8000u){
+                const size_t p=pivotBase+size_t(ref&0x7fffu)*6;if(p+6>b.size())throw std::runtime_error("BCA pivot rotation out of range");
+                const std::uint16_t sn=rd16(b,p);const float a=fx16s(rd16(b,p+2)),bb=fx16s(rd16(b,p+4));
+                Mat4f q=pivotMatrix(sn&15,(sn>>4)&15,a,bb);M3 m{};for(int r=0;r<3;r++)for(int c=0;c<3;c++)m.v[r*3+c]=q.m[r*4+c];return m;
+            }
+            const size_t p=basisBase+size_t(ref&0x7fffu)*10;if(p+10>b.size())throw std::runtime_error("BCA basis rotation out of range");
+            std::uint16_t input[5]={rd16(b,p+8),rd16(b,p),rd16(b,p+2),rd16(b,p+4),rd16(b,p+6)};
+            std::uint16_t raw[6]{};for(int i=0;i<5;i++){raw[i]=std::uint16_t(input[i]>>3);raw[5]=std::uint16_t((raw[5]<<3)|(input[i]&7));}
+            auto f13=[](std::uint16_t x){return float(signExtend(x,13))/4096.0f;};
+            Vec3f a{f13(raw[1]),f13(raw[2]),f13(raw[3])},bb{f13(raw[4]),f13(raw[0]),f13(raw[5])};
+            Vec3f c{a.y*bb.z-a.z*bb.y,a.z*bb.x-a.x*bb.z,a.x*bb.y-a.y*bb.x};
+            M3 m{}; // columns a,b,c
+            m.v[0]=a.x;m.v[3]=a.y;m.v[6]=a.z;m.v[1]=bb.x;m.v[4]=bb.y;m.v[7]=bb.z;m.v[2]=c.x;m.v[5]=c.y;m.v[8]=c.z;return m;
+        };
+        auto fillFloatCurve=[&](size_t& p,bool constant,float def,bool scale)->std::vector<float>{
+            std::vector<float> frames(out.frameCount,def);
+            if(constant){
+                if(scale){if(p+8>b.size())throw std::runtime_error("BCA scale constant truncated");float v=fx32s(rd32(b,p));p+=8;std::fill(frames.begin(),frames.end(),v);}
+                else {if(p+4>b.size())throw std::runtime_error("BCA translation constant truncated");float v=fx32s(rd32(b,p));p+=4;std::fill(frames.begin(),frames.end(),v);}return frames;
+            }
+            if(p+8>b.size())throw std::runtime_error("BCA curve descriptor truncated");
+            const std::uint32_t info=rd32(b,p),off=rd32(b,p+4);
+            p+=8;
+            const std::uint16_t start=std::uint16_t(info&0xffffu),end=std::uint16_t((info>>16)&0xfffu);const unsigned width=(info>>28)&3u,logRate=(info>>30)&3u;
+            if(end<=start)throw std::runtime_error("BCA curve frame range invalid");
+            const size_t count=size_t(end-start)>>logRate;
+            if(!count)return frames;
+            std::vector<float> values;values.reserve(count);size_t q=base+off;
+            for(size_t n=0;n<count;n++){
+                if(scale){if(width==0){if(q+8>b.size())throw std::runtime_error("BCA scale curve truncated");values.push_back(fx32s(rd32(b,q)));q+=8;}else{if(q+4>b.size())throw std::runtime_error("BCA short scale curve truncated");values.push_back(fx16s(rd16(b,q)));q+=4;}}
+                else {if(width==0){if(q+4>b.size())throw std::runtime_error("BCA translation curve truncated");values.push_back(fx32s(rd32(b,q)));q+=4;}else{if(q+2>b.size())throw std::runtime_error("BCA short translation curve truncated");values.push_back(fx16s(rd16(b,q)));q+=2;}}
+            }
+            for(size_t fr=0;fr<frames.size();fr++){
+                if(fr<=start)frames[fr]=values.front();
+                else if(fr>=size_t(end-1))frames[fr]=values.back();
+                else{float x=float(fr-start)/float((end-1)-start)*float(values.size()-1);size_t lo=size_t(std::floor(x)),hi=std::min(values.size()-1,lo+1);float t=x-float(lo);frames[fr]=values[lo]*(1.0f-t)+values[hi]*t;}
+            }return frames;
+        };
+        auto fillRotCurve=[&](size_t& p,bool constant)->std::vector<M3>{
+            std::vector<M3> frames(out.frameCount,identity3());
+            if(constant){if(p+4>b.size())throw std::runtime_error("BCA rotation constant truncated");auto m=fetchRotation(rd16(b,p));p+=4;std::fill(frames.begin(),frames.end(),m);return frames;}
+            if(p+8>b.size())throw std::runtime_error("BCA rotation curve descriptor truncated");
+            const std::uint32_t info=rd32(b,p),off=rd32(b,p+4);
+            p+=8;
+            const std::uint16_t start=std::uint16_t(info&0xffffu),end=std::uint16_t((info>>16)&0xfffu);
+            const unsigned logRate=(info>>30)&3u;
+            if(end<=start)throw std::runtime_error("BCA rotation range invalid");
+            const size_t count=size_t(end-start)>>logRate;
+            if(!count)return frames;
+            std::vector<M3> values;values.reserve(count);size_t q=base+off;if(q+count*2>b.size())throw std::runtime_error("BCA rotation samples truncated");for(size_t n=0;n<count;n++)values.push_back(fetchRotation(rd16(b,q+2*n)));
+            for(size_t fr=0;fr<frames.size();fr++){
+                if(fr<=start)frames[fr]=values.front();
+                else if(fr>=size_t(end-1))frames[fr]=values.back();
+                else{float x=float(fr-start)/float((end-1)-start)*float(values.size()-1);size_t lo=size_t(std::floor(x)),hi=std::min(values.size()-1,lo+1);float t=x-float(lo);M3 m{};for(int k=0;k<9;k++)m.v[k]=values[lo].v[k]*(1.0f-t)+values[hi].v[k]*t;frames[fr]=m;}
+            }return frames;
+        };
+        out.tracks.reserve(objectCount);
+        for(std::uint16_t oi=0;oi<objectCount;oi++){
+            const size_t track=base+rd16(b,base+20+2ull*oi);if(track+4>b.size())throw std::runtime_error("BCA object track out of range");size_t p=track;const std::uint16_t flags=rd16(b,p);p+=2;p++;const int target=int(b[p++]);
+            NsbcaJointTrack t;t.jointIndex=target;t.localFrames.assign(out.frameCount,toPublic(Mat4f::identity()));
+            if(flags&1u){out.tracks.push_back(std::move(t));continue;}
+            std::array<std::vector<float>,3> trans,scale;std::vector<M3> rot(out.frameCount,identity3());
+            const bool transAnimated=((flags>>1)&3u)==0;if(transAnimated)for(int k=0;k<3;k++)trans[k]=fillFloatCurve(p,(flags&(1u<<(3+k)))!=0,0.0f,false);else for(auto& v:trans)v.assign(out.frameCount,0.0f);
+            const bool rotAnimated=((flags>>6)&3u)==0;if(rotAnimated)rot=fillRotCurve(p,(flags&(1u<<8))!=0);
+            const bool scaleAnimated=((flags>>9)&3u)==0;if(scaleAnimated)for(int k=0;k<3;k++)scale[k]=fillFloatCurve(p,(flags&(1u<<(11+k)))!=0,1.0f,true);else for(auto& v:scale)v.assign(out.frameCount,1.0f);
+            for(size_t fr=0;fr<out.frameCount;fr++){
+                Mat4f m=Mat4f::identity();for(int r=0;r<3;r++)for(int c=0;c<3;c++)m.m[r*4+c]=rot[fr].v[r*3+c];
+                m=mmul(m,mscale(scale[0][fr],scale[1][fr],scale[2][fr]));m.m[3]=trans[0][fr];m.m[7]=trans[1][fr];m.m[11]=trans[2][fr];t.localFrames[fr]=toPublic(m);
+            }out.tracks.push_back(std::move(t));
+        }
+        out.valid=true;
+    }catch(const std::exception& e){out.error=e.what();}
+    return out;
+}
+
+NsbcaAnimation load_nsbca_from_narc(const std::filesystem::path& path,std::size_t index){auto b=read_narc_member(path,index);if(b.empty()){NsbcaAnimation o;o.error="NARC member missing";return o;}return parse_nsbca(b);}
+NsbcaAnimation load_build_model_nsbca(const std::filesystem::path& animationListNarc,const std::filesystem::path& animationNarc,std::size_t modelIndex){
+    auto list=read_narc_member(animationListNarc,modelIndex);NsbcaAnimation none;if(list.size()<12){none.error="build-model animation list missing";return none;}
+    for(size_t p=8;p+4<=list.size()&&p<24;p+=4){const std::uint32_t ref=std::uint32_t(list[p])|(std::uint32_t(list[p+1])<<8)|(std::uint32_t(list[p+2])<<16)|(std::uint32_t(list[p+3])<<24);if(ref==0xffffffffu)continue;auto bytes=read_narc_member(animationNarc,ref);if(bytes.size()>=4&&!std::memcmp(bytes.data(),"BCA0",4)){auto a=parse_nsbca(bytes);if(a.valid)return a;}}
+    none.error="no NSBCA animation for build model";return none;
+}
+
+NsbmdMatrix sample_nsbca_joint_delta(const NsbmdModel& model,const NsbcaAnimation& animation,int jointIndex,double seconds,double framesPerSecond){
+    Mat4f identity=Mat4f::identity();if(!animation.valid||!animation.frameCount||jointIndex<0||size_t(jointIndex)>=model.jointBindWorldMatrices.size())return toPublic(identity);
+    const size_t count=model.jointBindWorldMatrices.size();std::vector<Mat4f> local(count),world(count);std::vector<unsigned char> done(count,0);for(size_t i=0;i<count;i++)local[i]=(i<model.jointLocalMatrices.size())?fromPublic(model.jointLocalMatrices[i]):Mat4f::identity();
+    const size_t frame=size_t(std::uint64_t(std::max(0.0,std::floor(seconds*framesPerSecond)))%animation.frameCount);
+    for(auto const& t:animation.tracks)if(t.jointIndex>=0&&size_t(t.jointIndex)<count&&!t.localFrames.empty())local[size_t(t.jointIndex)]=fromPublic(t.localFrames[std::min(frame,t.localFrames.size()-1)]);
+    std::function<Mat4f(size_t)> calc=[&](size_t i)->Mat4f{if(done[i])return world[i];int parent=(i<model.jointParents.size())?model.jointParents[i]:-1;if(parent>=0&&size_t(parent)<count&&size_t(parent)!=i)world[i]=mmul(calc(size_t(parent)),local[i]);else world[i]=local[i];done[i]=1;return world[i];};
+    Mat4f animated=calc(size_t(jointIndex)),bind=fromPublic(model.jointBindWorldMatrices[size_t(jointIndex)]);return toPublic(mmul(animated,inverseAffine(bind)));
+}
+
+Vec3f transform_nsbmd_point(const NsbmdMatrix& matrix,Vec3f point){return transformPoint(fromPublic(matrix),point);}
+Vec3f transform_nsbmd_normal(const NsbmdMatrix& matrix,Vec3f normal){return transformNormal(fromPublic(matrix),normal);}
 
 NsbmdMember load_nsbmd_from_narc(const std::filesystem::path& path,std::size_t index){auto b=read_narc_member(path,index);if(b.empty()){NsbmdMember o;o.error="NARC member missing";return o;}return parse_nsbmd(b);}
 NsbmdMember load_nitro_texture_from_narc(const std::filesystem::path& path,std::size_t index){auto b=read_narc_member(path,index);if(b.empty()){NsbmdMember o;o.error="NARC member missing";return o;}return parse_nitro_texture_container(b);}
