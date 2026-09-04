@@ -3,11 +3,9 @@
 ## What is included
 
 - Native C/C++ engine source
-- Linux native executable from the v0.42 build
 - CMake/build scripts
 - Nitro/NARC/NSBMD/Nitro2D/SDAT loaders and other runtime format support
 - ROM extraction tooling
-- Tests, implementation notes, and v0.42 changes
 
 ## What is intentionally NOT included
 
